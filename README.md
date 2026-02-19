@@ -7,7 +7,7 @@ a terminal-first ai assistant cli built with ink + react.
 ## what it does
 
 - supports additive auth:
-  - `openai oauth` (chatgpt/codex-style account auth)
+  - `openai oauth` (codex account auth)
   - `openrouter api key`
 - first-run step-by-step onboarding:
   - choose auth providers
