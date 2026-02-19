@@ -22,7 +22,7 @@ export type OpenRouterModelCandidate = {
 };
 
 const OPENROUTER_BASE_URL = process.env.LOAF_OPENROUTER_BASE_URL?.trim() || "https://openrouter.ai/api/v1";
-const OPENROUTER_HTTP_REFERER = process.env.LOAF_OPENROUTER_HTTP_REFERER?.trim() || "https://github.com/veyzyn/loaf";
+const OPENROUTER_HTTP_REFERER = process.env.LOAF_OPENROUTER_HTTP_REFERER?.trim() || "https://github.com/crabmiau/loaf";
 const OPENROUTER_X_TITLE = process.env.LOAF_OPENROUTER_X_TITLE?.trim() || "loaf";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
