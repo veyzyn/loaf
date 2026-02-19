@@ -209,16 +209,6 @@ function resolveOriginator(candidate: string | undefined): string {
     return fromOption;
   }
 
-  const fromLoafEnv = process.env.LOAF_OPENAI_ORIGINATOR?.trim();
-  if (fromLoafEnv) {
-    return fromLoafEnv;
-  }
-
-  const fromCodexEnv = process.env.CODEX_INTERNAL_ORIGINATOR_OVERRIDE?.trim();
-  if (fromCodexEnv) {
-    return fromCodexEnv;
-  }
-
   return DEFAULT_ORIGINATOR;
 }
 

@@ -42,20 +42,13 @@ npm run dev
 - `/clear` clear conversation messages
 - `/help` show command list
 
-## environment variables
+## configuration
 
-`loaf` reads `.env.local` first, then `.env`.
+no env vars are required for normal use.
 
-- `LOAF_AUTH_PROVIDER` optional default provider (`openai` or `openrouter`)
-- `LOAF_OPENAI_MODEL` default openai model id
-- `LOAF_OPENROUTER_MODEL` default openrouter model id
-- `LOAF_OPENROUTER_API_KEY` or `OPENROUTER_API_KEY` openrouter key
-- `LOAF_EXA_API_KEY` or `EXA_API_KEY` exa key for `search_web`
-- `LOAF_THINKING_LEVEL` default thinking (`OFF`, `MINIMAL`, `LOW`, `MEDIUM`, `HIGH`, `XHIGH`)
-- `LOAF_INCLUDE_THOUGHTS` include thought stream (`true`/`false`)
-- `LOAF_SYSTEM_INSTRUCTION` override default runtime instruction
-- `LOAF_CHATGPT_BASE_URL` optional override for chatgpt codex backend
-- `LOAF_OPENAI_ORIGINATOR` optional oauth originator override
+- use onboarding + `/auth` for provider setup
+- use `/model` for model/thinking/provider routing
+- use `/onboarding` if you want to reconfigure search/auth later
 
 ## local data
 

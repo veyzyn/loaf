@@ -43,7 +43,7 @@ const RETRY_MAX_DELAY_MS = 20_000;
 export async function listVertexModels(apiKey: string): Promise<VertexModelCandidate[]> {
   const token = apiKey.trim();
   if (!token) {
-    throw new Error("Missing Vertex API key (VERTEX_API_KEY).");
+    throw new Error("Missing Vertex API key.");
   }
 
   const ai = new GoogleGenAI({
@@ -109,7 +109,7 @@ export async function runVertexInferenceStream(
 ): Promise<ModelResult> {
   const apiKey = request.apiKey.trim();
   if (!apiKey) {
-    throw new Error("Missing Vertex API key (VERTEX_API_KEY).");
+    throw new Error("Missing Vertex API key.");
   }
 
   const ai = new GoogleGenAI({

@@ -13,9 +13,9 @@ export type OpenAIRequest = {
   systemInstruction?: string;
 };
 
-const CHATGPT_CODEX_BASE_URL = process.env.LOAF_CHATGPT_BASE_URL?.trim() || "https://chatgpt.com/backend-api/codex";
+const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
 const OPENAI_MODELS_CLIENT_VERSION = "0.1.0";
-const OPENAI_MODELS_ORIGINATOR = process.env.LOAF_OPENAI_ORIGINATOR?.trim() || "codex_cli_rs";
+const OPENAI_MODELS_ORIGINATOR = "codex_cli_rs";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
 const RETRY_MAX_DELAY_MS = 20_000;

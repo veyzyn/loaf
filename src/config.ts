@@ -1,13 +1,3 @@
-import fs from "node:fs";
-import path from "node:path";
-import { config as loadDotEnv } from "dotenv";
-
-const localEnvPath = path.resolve(process.cwd(), ".env.local");
-if (fs.existsSync(localEnvPath)) {
-  loadDotEnv({ path: localEnvPath, quiet: true });
-}
-loadDotEnv({ quiet: true });
-
 export type ThinkingLevel = "OFF" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH" | "XHIGH";
 export type AuthProvider = "openrouter" | "openai";
 
@@ -48,55 +38,15 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   "never fabricate tool calls or tool results.",
 ].join("\n");
 
-function parseThinkingLevel(value: string | undefined): ThinkingLevel {
-  const normalized = (value ?? "HIGH").toUpperCase();
-  if (
-    normalized === "OFF" ||
-    normalized === "MINIMAL" ||
-    normalized === "LOW" ||
-    normalized === "MEDIUM" ||
-    normalized === "HIGH" ||
-    normalized === "XHIGH"
-  ) {
-    return normalized;
-  }
-  throw new Error(
-    `Invalid LOAF_THINKING_LEVEL "${value}". Use OFF, MINIMAL, LOW, MEDIUM, HIGH, or XHIGH.`,
-  );
-}
-
-function parsePreferredAuthProvider(value: string | undefined): AuthProvider | undefined {
-  const normalized = (value ?? "").trim().toLowerCase();
-  if (!normalized) {
-    return undefined;
-  }
-  if (normalized === "openrouter" || normalized === "openai") {
-    return normalized;
-  }
-  throw new Error(`Invalid LOAF_AUTH_PROVIDER "${value}". Use "openrouter" or "openai".`);
-}
-
 export const loafConfig = {
-  preferredAuthProvider: parsePreferredAuthProvider(process.env.LOAF_AUTH_PROVIDER),
-  openrouterApiKey:
-    process.env.LOAF_OPENROUTER_API_KEY?.trim() ||
-    process.env.OPENROUTER_API_KEY?.trim() ||
-    "",
-  exaApiKey:
-    process.env.LOAF_EXA_API_KEY?.trim() ||
-    process.env.EXA_API_KEY?.trim() ||
-    "",
-  openrouterModel:
-    process.env.LOAF_OPENROUTER_MODEL?.trim() ||
-    process.env.LOAF_MODEL?.trim() ||
-    "",
-  vertexApiKey: process.env.VERTEX_API_KEY?.trim() || "",
-  vertexModel:
-    process.env.LOAF_VERTEX_MODEL?.trim() ||
-    process.env.LOAF_MODEL?.trim() ||
-    "gemini-3-flash-preview",
-  openaiModel: process.env.LOAF_OPENAI_MODEL?.trim() || "gpt-4.1",
-  thinkingLevel: parseThinkingLevel(process.env.LOAF_THINKING_LEVEL),
-  includeThoughts: process.env.LOAF_INCLUDE_THOUGHTS !== "false",
-  systemInstruction: process.env.LOAF_SYSTEM_INSTRUCTION?.trim() || DEFAULT_SYSTEM_INSTRUCTION,
+  preferredAuthProvider: undefined as AuthProvider | undefined,
+  openrouterApiKey: "",
+  exaApiKey: "",
+  openrouterModel: "",
+  vertexApiKey: "",
+  vertexModel: "gemini-3-flash-preview",
+  openaiModel: "gpt-4.1",
+  thinkingLevel: "HIGH" as ThinkingLevel,
+  includeThoughts: true,
+  systemInstruction: DEFAULT_SYSTEM_INSTRUCTION,
 };
