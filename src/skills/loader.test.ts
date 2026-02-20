@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildDescriptionPreview,
   extractSkillDescription,
+  getRepoSkillsDirectories,
   getSkillsDirectories,
   getSkillsDirectory,
   loadSkillsCatalog,
@@ -189,5 +190,33 @@ describe("helpers", () => {
     const directories = getSkillsDirectories();
     expect(directories).toContain(path.join(os.homedir(), ".loaf", "skills"));
     expect(directories).toContain(path.join(os.homedir(), ".agents", "skills"));
+  });
+
+  it("finds repo .agents/skills roots from project root to cwd", () => {
+    const repoRoot = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-repo-skills-"));
+    tempDirs.push(repoRoot);
+    fs.writeFileSync(path.join(repoRoot, ".git"), "gitdir: test\n", "utf8");
+
+    const repoSkills = path.join(repoRoot, ".agents", "skills");
+    fs.mkdirSync(repoSkills, { recursive: true });
+
+    const nestedDir = path.join(repoRoot, "apps", "client");
+    fs.mkdirSync(nestedDir, { recursive: true });
+    const nestedSkills = path.join(nestedDir, ".agents", "skills");
+    fs.mkdirSync(nestedSkills, { recursive: true });
+
+    const cwd = path.join(nestedDir, "src");
+    fs.mkdirSync(cwd, { recursive: true });
+
+    const directories = getRepoSkillsDirectories(cwd);
+    expect(directories).toEqual([repoSkills, nestedSkills]);
+  });
+
+  it("returns no repo skill roots when cwd is not in a repo", () => {
+    const outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-no-repo-skills-"));
+    tempDirs.push(outsideDir);
+
+    const directories = getRepoSkillsDirectories(outsideDir);
+    expect(directories).toEqual([]);
   });
 });

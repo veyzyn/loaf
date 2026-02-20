@@ -1,6 +1,7 @@
 export {
   buildDescriptionPreview,
   extractSkillDescription,
+  getRepoSkillsDirectories,
   getSkillsDirectories,
   getSkillsDirectory,
   loadSkillsCatalog,

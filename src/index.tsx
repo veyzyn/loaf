@@ -203,7 +203,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
   { name: "/model", description: "choose model and thinking level" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
-  { name: "/skills", description: "list available skills from ~/.loaf/skills and ~/.agents/skills" },
+  { name: "/skills", description: "list available skills from repo .agents/skills, ~/.loaf/skills, and ~/.agents/skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
   { name: "/quit", description: "exit loaf" },

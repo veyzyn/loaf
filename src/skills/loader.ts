@@ -6,26 +6,41 @@ import type { SkillCatalog, SkillDefinition } from "./types.js";
 
 const SKILL_FILE_NAME = "SKILL.md";
 const DESCRIPTION_PREVIEW_WORDS = 8;
+const REPO_MARKER_NAME = ".git";
+const AGENTS_SKILLS_PATH_SEGMENTS = [".agents", "skills"] as const;
 
 export function getSkillsDirectory(): string {
   return path.join(getLoafDataDir(), "skills");
 }
 
+export function getRepoSkillsDirectories(cwd = process.cwd()): string[] {
+  const resolvedCwd = path.resolve(cwd);
+  const projectRoot = findProjectRootFromPath(resolvedCwd);
+  if (!projectRoot) {
+    return [];
+  }
+
+  const candidates = getDirectoriesBetween(projectRoot, resolvedCwd)
+    .map((dirPath) => path.join(dirPath, ...AGENTS_SKILLS_PATH_SEGMENTS))
+    .filter((skillsPath) => {
+      try {
+        return fs.statSync(skillsPath).isDirectory();
+      } catch {
+        return false;
+      }
+    });
+
+  return dedupePathList(candidates);
+}
+
 export function getSkillsDirectories(): string[] {
   const candidates = [
+    ...getRepoSkillsDirectories(),
     getSkillsDirectory(),
     path.join(os.homedir(), ".agents", "skills"),
   ];
 
-  const deduped: string[] = [];
-  for (const candidate of candidates) {
-    const normalized = candidate.trim();
-    if (!normalized || deduped.includes(normalized)) {
-      continue;
-    }
-    deduped.push(normalized);
-  }
-  return deduped;
+  return dedupePathList(candidates);
 }
 
 export function loadSkillsCatalog(skillsDirectories: string | string[] = getSkillsDirectories()): SkillCatalog {
@@ -157,4 +172,51 @@ function cleanMarkdownParagraph(paragraph: string): string {
     .trim();
 
   return withoutDecorators || "";
+}
+
+function findProjectRootFromPath(cwd: string): string | null {
+  let current = cwd;
+  while (true) {
+    if (fs.existsSync(path.join(current, REPO_MARKER_NAME))) {
+      return current;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return null;
+    }
+    current = parent;
+  }
+}
+
+function getDirectoriesBetween(root: string, cwd: string): string[] {
+  const stack: string[] = [];
+  let current = cwd;
+
+  while (true) {
+    stack.push(current);
+    if (current === root) {
+      break;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      break;
+    }
+    current = parent;
+  }
+
+  return stack.reverse();
+}
+
+function dedupePathList(candidates: string[]): string[] {
+  const deduped: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.trim();
+    if (!normalized || deduped.includes(normalized)) {
+      continue;
+    }
+    deduped.push(normalized);
+  }
+  return deduped;
 }
