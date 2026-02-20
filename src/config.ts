@@ -14,6 +14,7 @@ const DEFAULT_SYSTEM_INSTRUCTION = [
   "if the user says to decide on your own, stop asking preference questions and execute using safe assumptions.",
   "do not re-ask for details already provided by the user.",
   "for practical machine tasks, prefer doing the action directly over proposing scripts for the user to run.",
+  "you can run terminal/shell commands via javascript tools (run_js/run_js_module), e.g. using child_process from javascript.",
   "for coding tasks, create/edit/save files directly using javascript tools (run_js/run_js_module) instead of only describing code.",
   "to create reusable persistent tools, call create_persistent_tool.",
   "create_persistent_tool requires: name, description, handler_code; optional args_schema, filename, overwrite.",

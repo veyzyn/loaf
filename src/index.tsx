@@ -220,6 +220,7 @@ const SEARCH_WEB_PROMPT_EXTENSION = [
   "if search results are weak or conflicting, refine the query and search_web again before switching tools.",
   "for factual web lookups, call search_web first and use returned highlights before writing custom scrapers.",
 ].join("\n");
+const OS_PROMPT_EXTENSION = buildOsPromptExtension();
 
 function App() {
   const { exit } = useApp();
@@ -3121,6 +3122,7 @@ function buildRuntimeSystemInstruction(params: {
   if (params.hasExaSearch && !base.toLowerCase().includes("search_web")) {
     sections.push(SEARCH_WEB_PROMPT_EXTENSION);
   }
+  sections.push(OS_PROMPT_EXTENSION);
 
   const skillInstructionBlock = params.skillInstructionBlock?.trim() ?? "";
   if (skillInstructionBlock) {
@@ -3128,6 +3130,20 @@ function buildRuntimeSystemInstruction(params: {
   }
 
   return sections.filter(Boolean).join("\n\n").trim();
+}
+
+function buildOsPromptExtension(): string {
+  const platform = process.platform;
+  const arch = process.arch;
+  const osName =
+    platform === "darwin"
+      ? "macos"
+      : platform === "win32"
+        ? "windows"
+        : platform === "linux"
+          ? "linux"
+          : platform;
+  return `current host os: ${osName} (platform=${platform}, arch=${arch}). tailor commands and paths for this os.`;
 }
 
 void startApp();
