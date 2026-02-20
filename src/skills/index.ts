@@ -1,6 +1,7 @@
 export {
   buildDescriptionPreview,
   extractSkillDescription,
+  getSkillsDirectories,
   getSkillsDirectory,
   loadSkillsCatalog,
 } from "./loader.js";

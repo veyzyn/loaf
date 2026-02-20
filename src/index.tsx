@@ -203,12 +203,11 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
   { name: "/model", description: "choose model and thinking level" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
-  { name: "/skills", description: "list available skills from ~/.loaf/skills" },
+  { name: "/skills", description: "list available skills from ~/.loaf/skills and ~/.agents/skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
   { name: "/quit", description: "exit loaf" },
   { name: "/help", description: "show available commands" },
-  { name: "/quit", description: "exit loaf" },
   { name: "/exit", description: "exit loaf" },
 ];
 
@@ -1138,7 +1137,7 @@ function App() {
     if (command === "/skills") {
       const catalog = refreshSkillsCatalog();
       if (catalog.skills.length === 0) {
-        appendSystemMessage(`no skills found in ${catalog.directory}`);
+        appendSystemMessage(`no skills found in: ${catalog.directories.join(", ")}`);
         return;
       }
       const lines = catalog.skills
@@ -1614,6 +1613,8 @@ function App() {
 
     if (input.startsWith("/") && commandSuggestions.length > 0) {
       if (key.return) {
+        // Prevent TextInput onSubmit from dispatching the same slash command again.
+        suppressNextSubmitRef.current = true;
         runSlashCommand(input);
         return;
       }

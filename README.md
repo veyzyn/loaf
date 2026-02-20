@@ -28,7 +28,7 @@ a terminal-first ai assistant cli built with ink + react.
   - `create_persistent_tool` (creates + autoloads custom js tools)
 - optional web search tool via exa (`search_web`) with highlights
 - custom js tool loading from user folders
-- skill loading from `~/.loaf/skills/<skill-name>/SKILL.md`
+- skill loading from `~/.loaf/skills/<skill-name>/SKILL.md` and `~/.agents/skills/<skill-name>/SKILL.md`
 - automatic skill matching on each prompt (+ explicit `$skill-name` mentions)
 - automatic conversation reset when switching model providers
 
@@ -46,7 +46,7 @@ npm run dev
 - `/forgeteverything` wipe local config and restart onboarding
 - `/model` choose model, thinking level, and (for openrouter) routing provider
 - `/history` list/resume saved chats (`/history`, `/history last`, `/history <id>`)
-- `/skills` list available skills from `~/.loaf/skills` with description previews
+- `/skills` list available skills from `~/.loaf/skills` and `~/.agents/skills` with description previews
 - `/tools` list registered tools
 - `/clear` clear conversation messages
 - `/help` show command list
@@ -55,7 +55,7 @@ npm run dev
 
 ## skill usage
 
-- place skills at `~/.loaf/skills/<skill-name>/SKILL.md`
+- place skills at `~/.loaf/skills/<skill-name>/SKILL.md` or `~/.agents/skills/<skill-name>/SKILL.md`
 - use `/skills` to inspect what loaf found
 - start input with `$` to open skill autocomplete (`enter` / `tab` / `up` / `down`)
 - mention `$skill-name` in your prompt for explicit usage
@@ -84,7 +84,8 @@ loaf persists data in a single home directory:
 - `js-runtime/` transient js scripts created by `run_js`
 - `js-runtime/background/` transient js scripts created by `start_background_js`
 - `tools/` user-provided js tools (auto-loaded)
-- `skills/<skill-name>/SKILL.md` user-provided skill instructions (auto-discovered)
+- `skills/<skill-name>/SKILL.md` user-provided skill instructions in `~/.loaf` (auto-discovered)
+- `~/.agents/skills/<skill-name>/SKILL.md` alternate skill root (also auto-discovered)
 
 ## notes
 

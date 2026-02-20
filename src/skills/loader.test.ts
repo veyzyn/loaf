@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   buildDescriptionPreview,
   extractSkillDescription,
+  getSkillsDirectories,
   getSkillsDirectory,
   loadSkillsCatalog,
 } from "./loader.js";
@@ -24,6 +25,7 @@ describe("loadSkillsCatalog", () => {
     const catalog = loadSkillsCatalog(missingDir);
 
     expect(catalog.directory).toBe(missingDir);
+    expect(catalog.directories).toEqual([missingDir]);
     expect(catalog.skills).toEqual([]);
     expect(catalog.errors).toEqual([]);
   });
@@ -55,6 +57,7 @@ describe("loadSkillsCatalog", () => {
 
     const catalog = loadSkillsCatalog(rootDir);
 
+    expect(catalog.directories).toEqual([rootDir]);
     expect(catalog.skills.map((skill) => skill.name)).toEqual(["alpha-skill", "zeta-skill"]);
     expect(catalog.skills[0]?.description).toBe("alpha skill helps with command-line automation and debugging workflows.");
     expect(catalog.skills[0]?.descriptionPreview).toBe("alpha skill helps with command-line automation and debugging...");
@@ -71,6 +74,7 @@ describe("loadSkillsCatalog", () => {
     fs.mkdirSync(path.join(brokenDir, "SKILL.md"), { recursive: true });
 
     const catalog = loadSkillsCatalog(rootDir);
+    expect(catalog.directories).toEqual([rootDir]);
     expect(catalog.skills).toEqual([]);
     expect(catalog.errors).toHaveLength(1);
     expect(catalog.errors[0]).toContain("failed reading");
@@ -83,6 +87,7 @@ describe("loadSkillsCatalog", () => {
 
     const catalog = loadSkillsCatalog(filePath);
 
+    expect(catalog.directories).toEqual([filePath]);
     expect(catalog.skills).toEqual([]);
     expect(catalog.errors).toHaveLength(1);
     expect(catalog.errors[0]).toContain("failed reading skills directory");
@@ -96,6 +101,7 @@ describe("loadSkillsCatalog", () => {
     });
 
     const catalog = loadSkillsCatalog(rootDir);
+    expect(catalog.directories).toEqual([rootDir]);
     expect(catalog.errors).toHaveLength(1);
     expect(catalog.errors[0]).toContain("boom");
   });
@@ -113,9 +119,35 @@ describe("loadSkillsCatalog", () => {
     });
 
     const catalog = loadSkillsCatalog(rootDir);
+    expect(catalog.directories).toEqual([rootDir]);
     expect(catalog.skills).toEqual([]);
     expect(catalog.errors).toHaveLength(1);
     expect(catalog.errors[0]).toContain("read failed");
+  });
+
+  it("loads from multiple directories and skips duplicate skill names", () => {
+    const primaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-primary-"));
+    const secondaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-secondary-"));
+    tempDirs.push(primaryDir, secondaryDir);
+
+    const alphaPrimary = path.join(primaryDir, "alpha");
+    fs.mkdirSync(alphaPrimary, { recursive: true });
+    fs.writeFileSync(path.join(alphaPrimary, "SKILL.md"), "# Alpha\n\nfrom primary", "utf8");
+
+    const betaSecondary = path.join(secondaryDir, "beta");
+    fs.mkdirSync(betaSecondary, { recursive: true });
+    fs.writeFileSync(path.join(betaSecondary, "SKILL.md"), "# Beta\n\nfrom secondary", "utf8");
+
+    const alphaSecondary = path.join(secondaryDir, "alpha");
+    fs.mkdirSync(alphaSecondary, { recursive: true });
+    fs.writeFileSync(path.join(alphaSecondary, "SKILL.md"), "# Alpha\n\nduplicate secondary", "utf8");
+
+    const catalog = loadSkillsCatalog([primaryDir, secondaryDir]);
+
+    expect(catalog.directories).toEqual([primaryDir, secondaryDir]);
+    expect(catalog.skills.map((skill) => skill.name)).toEqual(["alpha", "beta"]);
+    expect(catalog.skills.find((skill) => skill.name === "alpha")?.sourcePath).toContain(primaryDir);
+    expect(catalog.errors.some((error) => error.includes('duplicate skill name "alpha"'))).toBe(true);
   });
 });
 
@@ -151,5 +183,11 @@ describe("helpers", () => {
   it("resolves ~/.loaf/skills directory", () => {
     const skillsDirectory = getSkillsDirectory();
     expect(skillsDirectory.endsWith(path.join(".loaf", "skills"))).toBe(true);
+  });
+
+  it("includes ~/.loaf/skills and ~/.agents/skills search roots", () => {
+    const directories = getSkillsDirectories();
+    expect(directories).toContain(path.join(os.homedir(), ".loaf", "skills"));
+    expect(directories).toContain(path.join(os.homedir(), ".agents", "skills"));
   });
 });

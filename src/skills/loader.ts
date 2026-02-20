@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { getLoafDataDir } from "../persistence.js";
 import type { SkillCatalog, SkillDefinition } from "./types.js";
@@ -10,72 +11,97 @@ export function getSkillsDirectory(): string {
   return path.join(getLoafDataDir(), "skills");
 }
 
-export function loadSkillsCatalog(skillsDirectory = getSkillsDirectory()): SkillCatalog {
+export function getSkillsDirectories(): string[] {
+  const candidates = [
+    getSkillsDirectory(),
+    path.join(os.homedir(), ".agents", "skills"),
+  ];
+
+  const deduped: string[] = [];
+  for (const candidate of candidates) {
+    const normalized = candidate.trim();
+    if (!normalized || deduped.includes(normalized)) {
+      continue;
+    }
+    deduped.push(normalized);
+  }
+  return deduped;
+}
+
+export function loadSkillsCatalog(skillsDirectories: string | string[] = getSkillsDirectories()): SkillCatalog {
+  const directories = Array.isArray(skillsDirectories)
+    ? skillsDirectories.map((entry) => entry.trim()).filter(Boolean)
+    : [skillsDirectories.trim()].filter(Boolean);
   const skills: SkillDefinition[] = [];
   const errors: string[] = [];
+  const seenSkillNames = new Set<string>();
 
-  if (!fs.existsSync(skillsDirectory)) {
-    return {
-      directory: skillsDirectory,
-      skills,
-      errors,
-    };
-  }
-
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(skillsDirectory, { withFileTypes: true });
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return {
-      directory: skillsDirectory,
-      skills,
-      errors: [`failed reading skills directory ${skillsDirectory}: ${message}`],
-    };
-  }
-
-  for (const entry of entries) {
-    if (!entry.isDirectory()) {
+  for (const skillsDirectory of directories) {
+    if (!fs.existsSync(skillsDirectory)) {
       continue;
     }
 
-    const directoryPath = path.join(skillsDirectory, entry.name);
-    const sourcePath = path.join(directoryPath, SKILL_FILE_NAME);
-    if (!fs.existsSync(sourcePath)) {
-      continue;
-    }
-
-    let rawContent = "";
+    let entries: fs.Dirent[];
     try {
-      rawContent = fs.readFileSync(sourcePath, "utf8");
+      entries = fs.readdirSync(skillsDirectory, { withFileTypes: true });
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      errors.push(`failed reading ${sourcePath}: ${message}`);
+      errors.push(`failed reading skills directory ${skillsDirectory}: ${message}`);
       continue;
     }
 
-    const content = rawContent.trim();
-    if (!content) {
-      errors.push(`skipped ${sourcePath}: empty skill content`);
-      continue;
-    }
+    for (const entry of entries) {
+      if (!entry.isDirectory()) {
+        continue;
+      }
 
-    const description = extractSkillDescription(content);
-    skills.push({
-      name: entry.name,
-      nameLower: entry.name.toLowerCase(),
-      description,
-      descriptionPreview: buildDescriptionPreview(description),
-      content,
-      sourcePath,
-      directoryPath,
-    });
+      const directoryPath = path.join(skillsDirectory, entry.name);
+      const sourcePath = path.join(directoryPath, SKILL_FILE_NAME);
+      if (!fs.existsSync(sourcePath)) {
+        continue;
+      }
+
+      let rawContent = "";
+      try {
+        rawContent = fs.readFileSync(sourcePath, "utf8");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        errors.push(`failed reading ${sourcePath}: ${message}`);
+        continue;
+      }
+
+      const content = rawContent.trim();
+      if (!content) {
+        errors.push(`skipped ${sourcePath}: empty skill content`);
+        continue;
+      }
+
+      const nameLower = entry.name.toLowerCase();
+      if (seenSkillNames.has(nameLower)) {
+        errors.push(`skipped ${sourcePath}: duplicate skill name "${entry.name}"`);
+        continue;
+      }
+      seenSkillNames.add(nameLower);
+
+      const description = extractSkillDescription(content);
+      skills.push({
+        name: entry.name,
+        nameLower,
+        description,
+        descriptionPreview: buildDescriptionPreview(description),
+        content,
+        sourcePath,
+        directoryPath,
+      });
+    }
   }
 
   skills.sort((left, right) => left.name.localeCompare(right.name));
+  const directoryLabel = directories.join(", ");
 
   return {
-    directory: skillsDirectory,
+    directory: directoryLabel,
+    directories,
     skills,
     errors,
   };

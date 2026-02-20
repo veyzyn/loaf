@@ -10,6 +10,7 @@ export type SkillDefinition = {
 
 export type SkillCatalog = {
   directory: string;
+  directories: string[];
   skills: SkillDefinition[];
   errors: string[];
 };
