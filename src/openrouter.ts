@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { loafConfig, type ThinkingLevel } from "./config.js";
 import { defaultToolRegistry, defaultToolRuntime } from "./tools/index.js";
-import type { ChatMessage, DebugEvent, ModelResult, StreamChunk } from "./vertex.js";
+import type { ChatMessage, DebugEvent, ModelResult, StreamChunk } from "./chat-types.js";
 
 export type OpenRouterRequest = {
   apiKey: string;
@@ -11,6 +11,8 @@ export type OpenRouterRequest = {
   includeThoughts: boolean;
   forcedProvider: string | null;
   systemInstruction?: string;
+  signal?: AbortSignal;
+  drainSteeringMessages?: () => ChatMessage[];
 };
 
 export type OpenRouterModelCandidate = {
@@ -27,6 +29,7 @@ const OPENROUTER_X_TITLE = "loaf";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
 const RETRY_MAX_DELAY_MS = 20_000;
+const SAFE_PROVIDER_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 export async function listOpenRouterModels(apiKey: string): Promise<OpenRouterModelCandidate[]> {
   const token = apiKey.trim();
@@ -118,7 +121,7 @@ export async function runOpenRouterInferenceStream(
     },
   });
 
-  const tools = buildToolDeclarations();
+  const toolDeclarations = buildToolDeclarations();
   const startedAt = Date.now();
   let toolRound = 0;
   const systemInstruction = request.systemInstruction?.trim() || loafConfig.systemInstruction;
@@ -135,12 +138,34 @@ export async function runOpenRouterInferenceStream(
   ];
 
   while (true) {
+    assertNotAborted(request.signal);
+
+    const steeringMessages = request.drainSteeringMessages?.() ?? [];
+    if (steeringMessages.length > 0) {
+      conversation.push(
+        ...steeringMessages.map((message) => ({
+          role: message.role,
+          content: message.text,
+        })),
+      );
+      onDebug?.({
+        stage: "steer_injected",
+        data: {
+          count: steeringMessages.length,
+          messages: steeringMessages.map((message) => ({
+            role: message.role,
+            preview: message.text.slice(0, 160),
+          })),
+        },
+      });
+    }
+
     toolRound += 1;
 
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       messages: conversation,
-      tools,
+      tools: toolDeclarations.declarations,
       tool_choice: "auto",
       parallel_tool_calls: false,
       stream: false,
@@ -170,7 +195,7 @@ export async function runOpenRouterInferenceStream(
       },
     });
 
-    const response = await createCompletionWithRetry(client, requestPayload, toolRound, onDebug);
+    const response = await createCompletionWithRetry(client, requestPayload, toolRound, onDebug, request.signal);
     onDebug?.({
       stage: "response_raw",
       data: {
@@ -214,27 +239,31 @@ export async function runOpenRouterInferenceStream(
       });
 
       for (let i = 0; i < toolCalls.length; i += 1) {
+        assertNotAborted(request.signal);
         const call = (toolCalls[i] ?? {}) as Record<string, unknown>;
         const functionRecord =
           typeof call.function === "object" && call.function !== null ? (call.function as Record<string, unknown>) : {};
-        const callName = readTrimmedString(functionRecord.name);
-        const callId = readTrimmedString(call.id) || `${callName || "tool"}-${toolRound}-${i}`;
+        const providerToolName = readTrimmedString(functionRecord.name);
+        const runtimeToolName =
+          toolDeclarations.providerToRuntimeName.get(providerToolName) ?? providerToolName;
+        const callId = readTrimmedString(call.id) || `${providerToolName || "tool"}-${toolRound}-${i}`;
         const argumentsRaw = readTrimmedString(functionRecord.arguments) || "{}";
         const callArgs = safeParseObject(argumentsRaw);
 
         const toolResult = await defaultToolRuntime.execute(
           {
             id: callId,
-            name: callName,
+            name: runtimeToolName,
             input: callArgs as never,
           },
           {
             now: new Date(),
+            signal: request.signal,
           },
         );
 
         executed.push({
-          name: callName,
+          name: runtimeToolName,
           ok: toolResult.ok,
           input: callArgs,
           result: toolResult.output,
@@ -309,18 +338,27 @@ function normalizeForcedProvider(value: string | null): string | null {
   return trimmed;
 }
 
-function buildToolDeclarations(): Array<Record<string, unknown>> {
-  return defaultToolRegistry.list().map((tool) => {
+function buildToolDeclarations(): {
+  declarations: Array<Record<string, unknown>>;
+  providerToRuntimeName: Map<string, string>;
+} {
+  const declarations: Array<Record<string, unknown>> = [];
+  const providerToRuntimeName = new Map<string, string>();
+  const usedProviderNames = new Set<string>();
+
+  for (const tool of defaultToolRegistry.list()) {
     const schema = tool.inputSchema ?? {
       type: "object",
       properties: {},
       required: [],
     };
 
-    return {
+    const providerName = toProviderToolName(tool.name, usedProviderNames);
+    providerToRuntimeName.set(providerName, tool.name);
+    declarations.push({
       type: "function",
       function: {
-        name: tool.name,
+        name: providerName,
         description: tool.description,
         parameters: {
           type: schema.type,
@@ -329,8 +367,46 @@ function buildToolDeclarations(): Array<Record<string, unknown>> {
           additionalProperties: false,
         },
       },
-    };
-  });
+    });
+  }
+
+  return {
+    declarations,
+    providerToRuntimeName,
+  };
+}
+
+function toProviderToolName(runtimeName: string, usedNames: Set<string>): string {
+  const baseName = runtimeName.trim() || "tool";
+  let candidate = SAFE_PROVIDER_TOOL_NAME_PATTERN.test(baseName)
+    ? baseName
+    : baseName
+        .replace(/[^a-zA-Z0-9_-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "");
+
+  if (!candidate) {
+    candidate = "tool";
+  }
+  if (!/^[a-zA-Z_]/.test(candidate)) {
+    candidate = `tool_${candidate}`;
+  }
+  if (candidate.length > 64) {
+    candidate = candidate.slice(0, 64).replace(/_+$/g, "");
+    if (!candidate) {
+      candidate = "tool";
+    }
+  }
+
+  let uniqueName = candidate;
+  let suffix = 2;
+  while (usedNames.has(uniqueName)) {
+    const suffixText = `_${suffix++}`;
+    const maxBaseLength = Math.max(1, 64 - suffixText.length);
+    uniqueName = `${candidate.slice(0, maxBaseLength)}${suffixText}`;
+  }
+  usedNames.add(uniqueName);
+  return uniqueName;
 }
 
 async function createCompletionWithRetry(
@@ -338,13 +414,21 @@ async function createCompletionWithRetry(
   requestPayload: Record<string, unknown>,
   toolRound: number,
   onDebug?: (event: DebugEvent) => void,
+  signal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   let attempt = 0;
   while (true) {
+    assertNotAborted(signal);
     attempt += 1;
     try {
-      return (await client.chat.completions.create(requestPayload as never)) as unknown as Record<string, unknown>;
+      return (await client.chat.completions.create(
+        requestPayload as never,
+        signal ? ({ signal } as never) : undefined,
+      )) as unknown as Record<string, unknown>;
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
       const retryable = isRetryable429Error(error);
       if (!retryable || attempt >= MAX_429_RETRY_ATTEMPTS) {
         throw error;
@@ -361,7 +445,7 @@ async function createCompletionWithRetry(
           error: summarizeError(error),
         },
       });
-      await sleep(delayMs);
+      await sleep(delayMs, signal);
     }
   }
 }
@@ -600,10 +684,39 @@ function computeRetryDelayMs(attempt: number): number {
   return Math.max(250, Math.floor(capped + jitter));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  assertNotAborted(signal);
+  return new Promise((resolve, reject) => {
+    const handle = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(handle);
+      cleanup();
+      reject(createAbortError());
+    };
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+function createAbortError(): Error {
+  const error = new Error("Request interrupted by user.");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function summarizeError(error: unknown): string {

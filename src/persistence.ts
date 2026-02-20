@@ -101,6 +101,7 @@ function readStateFromPath(stateFilePath: string): LoafPersistedState | null {
       return null;
     }
 
+    // Backward-compat: map legacy "vertex" persisted provider values to openrouter.
     const authProvider =
       parsed.authProvider === "openai"
         ? "openai"

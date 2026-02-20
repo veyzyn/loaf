@@ -22,6 +22,7 @@ a terminal-first ai assistant cli built with ink + react.
   - `run_js`
   - `install_js_packages`
   - `run_js_module`
+  - `create_persistent_tool` (creates + autoloads custom js tools)
 - optional web search tool via exa (`search_web`) with highlights
 - custom js tool loading from user folders
 - automatic conversation reset when switching model providers

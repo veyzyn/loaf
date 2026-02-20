@@ -30,7 +30,7 @@ import {
 import { runOpenAiInferenceStream } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
-import type { ChatMessage, DebugEvent } from "./vertex.js";
+import type { ChatMessage, DebugEvent } from "./chat-types.js";
 
 type UiMessage = {
   id: number;
@@ -279,6 +279,8 @@ function App() {
   const [inputHistoryDraft, setInputHistoryDraft] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
   const nextIdRef = useRef(1);
+  const activeInferenceAbortControllerRef = useRef<AbortController | null>(null);
+  const steeringQueueRef = useRef<ChatMessage[]>([]);
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
@@ -440,6 +442,38 @@ function App() {
     for (const row of rows) {
       appendSystemMessage(row);
     }
+  };
+
+  const queueSteeringMessage = (rawText: string): boolean => {
+    const text = rawText.trim();
+    if (!text) {
+      return false;
+    }
+    steeringQueueRef.current.push({
+      role: "user",
+      text,
+    });
+    setMessages((current) => [
+      ...current,
+      {
+        id: nextMessageId(),
+        kind: "user",
+        text,
+      },
+    ]);
+    setInput("");
+    setStatusLabel("steer queued...");
+    return true;
+  };
+
+  const interruptActiveInference = (): boolean => {
+    const controller = activeInferenceAbortControllerRef.current;
+    if (!controller || controller.signal.aborted) {
+      return false;
+    }
+    setStatusLabel("interrupting...");
+    controller.abort();
+    return true;
   };
 
   const openOnboardingSelector = () => {
@@ -1060,6 +1094,13 @@ function App() {
       return;
     }
 
+    if (key.escape && pending && activeInferenceAbortControllerRef.current) {
+      if (interruptActiveInference()) {
+        appendSystemMessage("interrupt requested. waiting for current step to stop...");
+      }
+      return;
+    }
+
     if (selector) {
       if (key.escape) {
         if (selector.kind === "onboarding") {
@@ -1436,6 +1477,9 @@ function App() {
     setInputHistoryDraft("");
     setPending(true);
     setStatusLabel(selectedThinking === "OFF" ? "drafting response..." : "thinking...");
+    steeringQueueRef.current = [];
+    const inferenceAbortController = new AbortController();
+    activeInferenceAbortControllerRef.current = inferenceAbortController;
 
     const providerSwitchRequiresReset =
       conversationProvider !== null && conversationProvider !== provider && history.length > 0;
@@ -1484,6 +1528,25 @@ function App() {
     };
     setMessages((current) => [...current, nextUserMessage]);
 
+    let assistantDraftText = "";
+
+    const appendAssistantDraftDelta = (deltaText: string) => {
+      if (!deltaText) {
+        return;
+      }
+      assistantDraftText += deltaText;
+    };
+
+    const drainSteeringMessages = (): ChatMessage[] => {
+      const queued = steeringQueueRef.current;
+      if (queued.length === 0) {
+        return [];
+      }
+      steeringQueueRef.current = [];
+      setStatusLabel("steer applied; continuing...");
+      return queued;
+    };
+
     try {
       const handleChunk = (chunk: { thoughts: string[]; answerText: string }) => {
         for (const rawThought of chunk.thoughts) {
@@ -1492,6 +1555,7 @@ function App() {
         }
 
         if (chunk.answerText) {
+          appendAssistantDraftDelta(chunk.answerText);
           setStatusLabel("drafting response...");
         }
       };
@@ -1519,6 +1583,8 @@ function App() {
                     ? null
                     : normalizeOpenRouterProviderSelection(selectedOpenRouterProvider),
                 systemInstruction: runtimeSystemInstruction,
+                signal: inferenceAbortController.signal,
+                drainSteeringMessages,
               },
               handleChunk,
               handleDebug,
@@ -1532,11 +1598,14 @@ function App() {
                 thinkingLevel: selectedThinking,
                 includeThoughts: selectedThinking !== "OFF",
                 systemInstruction: runtimeSystemInstruction,
+                signal: inferenceAbortController.signal,
+                drainSteeringMessages,
               },
               handleChunk,
               handleDebug,
             );
 
+      assistantDraftText = result.answer;
       const assistantMessage: ChatMessage = {
         role: "assistant",
         text: result.answer,
@@ -1571,7 +1640,53 @@ function App() {
           text: result.answer,
         },
       ]);
+
     } catch (error) {
+      if (isAbortError(error)) {
+        const interruptedAssistant = assistantDraftText.trim();
+        const interruptedHistory = interruptedAssistant
+          ? [...nextHistory, { role: "assistant" as const, text: interruptedAssistant }]
+          : nextHistory;
+        setHistory(interruptedHistory);
+        setConversationProvider(provider);
+
+        if (sessionForTurn) {
+          try {
+            const updatedSession = writeChatSession({
+              session: sessionForTurn,
+              messages: interruptedHistory,
+              provider,
+              model: selectedModel,
+              thinkingLevel: selectedThinking,
+              openRouterProvider: normalizedOpenRouterProvider,
+              titleHint: cleanPrompt,
+            });
+            setActiveSession(updatedSession);
+          } catch (sessionError) {
+            const message = sessionError instanceof Error ? sessionError.message : String(sessionError);
+            appendSystemMessage(`chat history save failed: ${message}`);
+          }
+        }
+
+        if (interruptedAssistant) {
+          setMessages((current) => [
+            ...current,
+            {
+              id: nextMessageId(),
+              kind: "assistant",
+              text: interruptedAssistant,
+            },
+          ]);
+        }
+
+        appendSystemMessage(
+          interruptedAssistant
+            ? "response interrupted by user. partial output kept."
+            : "response interrupted by user.",
+        );
+        return;
+      }
+
       const message = error instanceof Error ? error.message : String(error);
       setMessages((current) => [
         ...current,
@@ -1582,8 +1697,16 @@ function App() {
         },
       ]);
     } finally {
+      const unappliedSteerCount = steeringQueueRef.current.length;
+      steeringQueueRef.current = [];
+      activeInferenceAbortControllerRef.current = null;
       setPending(false);
       setStatusLabel("ready");
+      if (unappliedSteerCount > 0) {
+        appendSystemMessage(
+          `${unappliedSteerCount} steer message(s) were queued too late and not applied.`,
+        );
+      }
     }
   };
 
@@ -1708,6 +1831,28 @@ function App() {
               return;
             }
 
+            if (pending) {
+              if (!activeInferenceAbortControllerRef.current) {
+                appendSystemMessage("busy. wait for current operation to finish.");
+                return;
+              }
+
+              if (trimmed.startsWith("/")) {
+                const steerText = parseSteerCommand(trimmed);
+                if (!steerText) {
+                  appendSystemMessage(
+                    "while running, send plain text (or /steer <message>) to steer, or press esc to interrupt.",
+                  );
+                  return;
+                }
+                queueSteeringMessage(steerText);
+                return;
+              }
+
+              queueSteeringMessage(trimmed);
+              return;
+            }
+
             if (trimmed.startsWith("/")) {
               runSlashCommand(trimmed);
               return;
@@ -1729,9 +1874,25 @@ function App() {
           showCursor
         />
       </Box>
-      <Text color="gray">{exitShortcutLabel} exit | /help for commands</Text>
+      <Text color="gray">
+        {pending ? "esc interrupt | enter to steer | " : ""}
+        {exitShortcutLabel} exit | /help for commands
+      </Text>
     </Box>
   );
+}
+
+function parseSteerCommand(rawInput: string): string | null {
+  const trimmed = rawInput.trim();
+  if (!trimmed.toLowerCase().startsWith("/steer")) {
+    return null;
+  }
+  const payload = trimmed.slice("/steer".length).trim();
+  return payload || null;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function safeJsonStringify(value: unknown): string {
@@ -1781,9 +1942,7 @@ function formatToolRows(data: unknown): string[] {
 
 function shouldCollapseSuccessDetail(name: string): boolean {
   return (
-    name !== "install_pip" &&
-    name !== "run_py" &&
-    name !== "run_py_module" &&
+    name !== "create_persistent_tool" &&
     name !== "install_js_packages" &&
     name !== "run_js" &&
     name !== "run_js_module" &&
@@ -1799,17 +1958,6 @@ function formatToolRow(summary: string, detail: string): string {
 
 function formatToolSummary(name: string, input: unknown, result: unknown): string {
   const payload = getToolPayload(input, result);
-  const selector = typeof payload.selector === "string" ? payload.selector : undefined;
-  const x = typeof payload.x === "number" ? payload.x : undefined;
-  const y = typeof payload.y === "number" ? payload.y : undefined;
-
-  if (name === "install_pip") {
-    const packages = getPythonPackages(payload, result);
-    if (packages.length > 0) {
-      return `installed ${packages.length} package(s)`;
-    }
-    return "installed python package(s)";
-  }
 
   if (name === "install_js_packages") {
     const packages = getJavaScriptPackages(payload, result);
@@ -1819,21 +1967,8 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
     return "installed javascript package(s)";
   }
 
-  if (name === "run_py") {
-    return "executed python script";
-  }
-
   if (name === "run_js") {
     return "executed javascript script";
-  }
-
-  if (name === "run_py_module") {
-    const record = isRecord(result) ? result : {};
-    const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
-    if (moduleName) {
-      return `ran python module ${moduleName}`;
-    }
-    return "ran python module";
   }
 
   if (name === "run_js_module") {
@@ -1853,129 +1988,8 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
     return "searched web";
   }
 
-  if (name === "click") {
-    if (selector) {
-      return `clicked on ${selector}`;
-    }
-    if (typeof x === "number" && typeof y === "number") {
-      return `clicked at (${x}, ${y})`;
-    }
-    return "clicked";
-  }
-
-  if (name === "type") {
-    if (selector) {
-      return `typed into ${selector}`;
-    }
-    return "typed text";
-  }
-
-  if (name === "scroll") {
-    const target = typeof payload.target === "string" ? payload.target : undefined;
-    if (target) {
-      return `scrolled ${target}`;
-    }
-    return "scrolled";
-  }
-
-  if (name === "drag") {
-    return "dragged";
-  }
-
-  if (name === "wait") {
-    const ms = typeof payload.ms === "number" ? payload.ms : undefined;
-    if (typeof ms === "number") {
-      return `waited ${ms}ms`;
-    }
-    return "waited";
-  }
-
-  if (name === "create_browser") {
-    const url = typeof payload.url === "string" ? payload.url : undefined;
-    if (url) {
-      return `opened browser at ${url}`;
-    }
-    return "opened browser";
-  }
-
-  if (name === "close_browser") {
-    return "closed browser";
-  }
-
-  if (name === "navigate") {
-    const url = typeof payload.url === "string" ? payload.url : undefined;
-    if (url) {
-      return `navigated to ${url}`;
-    }
-    return "navigated";
-  }
-
-  if (name === "reload") {
-    return "reloaded page";
-  }
-
-  if (name === "go_back") {
-    return "went back";
-  }
-
-  if (name === "go_forward") {
-    return "went forward";
-  }
-
-  if (name === "page_info") {
-    return "read page info";
-  }
-
-  if (name === "get_html") {
-    const htmlSelector = typeof payload.selector === "string" ? payload.selector : undefined;
-    if (htmlSelector) {
-      return `read html for ${htmlSelector}`;
-    }
-    return "read page html";
-  }
-
-  if (name === "get_text") {
-    const textSelector = typeof payload.selector === "string" ? payload.selector : undefined;
-    if (textSelector) {
-      return `read text for ${textSelector}`;
-    }
-    return "read page text";
-  }
-
-  if (name === "find") {
-    const findSelector = typeof payload.selector === "string" ? payload.selector : undefined;
-    const query = typeof payload.query === "string" ? payload.query : undefined;
-    if (findSelector) {
-      return `searched selector ${findSelector}`;
-    }
-    if (query) {
-      return `searched text "${query}"`;
-    }
-    return "searched page";
-  }
-
-  if (name === "list_links") {
-    return "listed links";
-  }
-
-  if (name === "screenshot") {
-    return "captured screenshot";
-  }
-
-  if (name === "hover") {
-    const hoverSelector = typeof payload.selector === "string" ? payload.selector : undefined;
-    if (hoverSelector) {
-      return `hovered ${hoverSelector}`;
-    }
-    return "hovered";
-  }
-
-  if (name === "press_key") {
-    const key = typeof payload.key === "string" ? payload.key : undefined;
-    if (key) {
-      return `pressed ${key}`;
-    }
-    return "pressed key";
+  if (name === "create_persistent_tool") {
+    return "created persistent tool";
   }
 
   return `${name} executed`;
@@ -1986,7 +2000,6 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
   const status = typeof record.status === "string" ? record.status.toLowerCase() : "";
   const note = typeof record.note === "string" ? simplifyToolNote(record.note) : "";
   const payload = getToolPayload(input, result);
-  const data = isRecord(record.data) ? record.data : {};
 
   const formatWithStatus = (value: string): string => {
     const trimmed = value.trim();
@@ -1999,24 +2012,12 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
     return note || status || "ok";
   };
 
-  if (name === "install_pip") {
-    return formatWithStatus(formatInstallPipDetail(payload, record));
-  }
-
   if (name === "install_js_packages") {
     return formatWithStatus(formatInstallJsPackagesDetail(payload, record));
   }
 
-  if (name === "run_py") {
-    return formatWithStatus(formatRunPyDetail(payload, record));
-  }
-
   if (name === "run_js") {
     return formatWithStatus(formatRunJsDetail(payload, record));
-  }
-
-  if (name === "run_py_module") {
-    return formatWithStatus(formatRunPyModuleDetail(payload, record));
   }
 
   if (name === "run_js_module") {
@@ -2027,63 +2028,10 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
     return formatWithStatus(formatSearchWebDetail(payload, record));
   }
 
-  if (name === "type") {
-    const typedText = typeof payload.text === "string" ? payload.text.trim() : "";
-    if (typedText) {
-      return formatWithStatus(clipInline(typedText, 140));
-    }
-  }
-
-  if (name === "find") {
-    const count = typeof data.count === "number" ? data.count : undefined;
-    if (typeof count === "number") {
-      return formatWithStatus(`${count} match(es)`);
-    }
-  }
-
-  if (name === "list_links") {
-    const count = typeof data.count === "number" ? data.count : undefined;
-    if (typeof count === "number") {
-      return formatWithStatus(`${count} link(s)`);
-    }
-  }
-
-  if (name === "page_info") {
-    const title = typeof data.title === "string" ? data.title.trim() : "";
-    const url = typeof data.url === "string" ? data.url.trim() : "";
-    if (title && url) {
-      return formatWithStatus(`${clipInline(title, 70)} | ${clipInline(url, 90)}`);
-    }
-    if (title) {
-      return formatWithStatus(clipInline(title, 90));
-    }
-  }
-
-  if (name === "get_text") {
-    const text = typeof data.text === "string" ? data.text.trim() : "";
-    if (text) {
-      return formatWithStatus(clipInline(text, 140));
-    }
-  }
-
-  if (name === "get_html") {
-    const html = typeof data.html === "string" ? data.html.trim() : "";
-    if (html) {
-      return formatWithStatus(clipInline(html, 140));
-    }
-  }
-
-  if (name === "screenshot") {
-    const imagePath = typeof data.path === "string" ? data.path : "";
-    if (imagePath) {
-      return formatWithStatus(imagePath);
-    }
-  }
-
-  if (name === "navigate" || name === "create_browser") {
-    const currentUrl = typeof record.currentUrl === "string" ? record.currentUrl.trim() : "";
-    if (currentUrl) {
-      return formatWithStatus(currentUrl);
+  if (name === "create_persistent_tool") {
+    const message = readTrimmedString(record.message);
+    if (message) {
+      return formatWithStatus(clipInline(message, 180));
     }
   }
 
@@ -2172,18 +2120,8 @@ function normalizeLogText(value: string): string {
 
 function isGenericSuccessBody(value: string): boolean {
   return (
-    value === "click completed" ||
-    value === "drag completed" ||
-    value === "scroll completed" ||
-    value === "typed text" ||
-    value === "waited" ||
-    value === "hovered" ||
-    value === "navigated" ||
-    value === "page reloaded" ||
-    value === "navigated back" ||
-    value === "navigated forward" ||
-    value === "closed browser session" ||
-    value === "opened browser"
+    value === "tool executed" ||
+    value === "ok"
   );
 }
 
@@ -2213,36 +2151,9 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-function getPythonPackages(payload: Record<string, unknown>, result: unknown): string[] {
-  const record = isRecord(result) ? result : {};
-  return toStringArray(record.packages ?? payload.packages);
-}
-
 function getJavaScriptPackages(payload: Record<string, unknown>, result: unknown): string[] {
   const record = isRecord(result) ? result : {};
   return toStringArray(record.packages ?? payload.packages);
-}
-
-function formatInstallPipDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
-  const packages = getPythonPackages(payload, record);
-  const packageSummary =
-    packages.length > 0
-      ? packages.length <= 3
-        ? packages.join(", ")
-        : `${packages.slice(0, 3).join(", ")}, +${packages.length - 3} more`
-      : "packages";
-
-  const outcome = summarizeInstallPipOutput(record);
-  if (outcome) {
-    const firstLine = outcome
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .find(Boolean);
-    return firstLine ? `${packageSummary} | ${clipInline(firstLine, 140)}` : packageSummary;
-  }
-
-  return packageSummary;
 }
 
 function formatInstallJsPackagesDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
@@ -2267,21 +2178,6 @@ function formatInstallJsPackagesDetail(payload: Record<string, unknown>, record:
   return packageSummary;
 }
 
-function formatRunPyDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
-  const output = getCombinedProcessOutput(record);
-  if (output) {
-    const firstLine = output
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .find(Boolean);
-    if (firstLine) {
-      return clipInline(firstLine, 180);
-    }
-  }
-  return "no stdout/stderr";
-}
-
 function formatRunJsDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
   const output = getCombinedProcessOutput(record);
   if (output) {
@@ -2295,24 +2191,6 @@ function formatRunJsDetail(payload: Record<string, unknown>, record: Record<stri
     }
   }
   return "no stdout/stderr";
-}
-
-function formatRunPyModuleDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
-  const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
-  const modulePrefix = moduleName ? `${moduleName} | ` : "";
-
-  const output = getCombinedProcessOutput(record);
-  if (output) {
-    const firstLine = output
-      .replace(/\r\n/g, "\n")
-      .split("\n")
-      .map((line) => line.trim())
-      .find(Boolean);
-    if (firstLine) {
-      return `${modulePrefix}${clipInline(firstLine, 180)}`;
-    }
-  }
-  return `${modulePrefix}no stdout/stderr`.trim();
 }
 
 function formatRunJsModuleDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
@@ -2338,49 +2216,6 @@ function formatSearchWebDetail(payload: Record<string, unknown>, record: Record<
   return typeof countRaw === "number" ? `${countRaw} result(s)` : "results";
 }
 
-function formatProcessCommand(record: Record<string, unknown>): string {
-  const command = readTrimmedString(record.command);
-  if (!command) {
-    return "";
-  }
-  const args = toStringArray(record.args);
-  const normalized = [command, ...args].map(quoteCommandToken).join(" ");
-  return `\`${normalized}\``;
-}
-
-function quoteCommandToken(value: string): string {
-  if (/^[a-zA-Z0-9_./:\\=-]+$/.test(value)) {
-    return value;
-  }
-  return JSON.stringify(value);
-}
-
-function formatDurationMs(value: unknown): string {
-  if (typeof value !== "number" || !Number.isFinite(value) || value < 0) {
-    return "";
-  }
-  if (value < 1_000) {
-    return `${Math.round(value)}ms`;
-  }
-  const seconds = value / 1_000;
-  if (seconds < 60) {
-    return `${seconds.toFixed(seconds < 10 ? 2 : 1)}s`;
-  }
-  const minutes = Math.floor(seconds / 60);
-  const remSeconds = seconds - minutes * 60;
-  return `${minutes}m ${remSeconds.toFixed(1)}s`;
-}
-
-function formatProcessOutputBlock(label: string, value: unknown, truncatedValue: unknown): string {
-  const text = readTrimmedString(value);
-  if (!text) {
-    return "";
-  }
-  const clipped = clipBlock(text, 60, 6_000);
-  const block = formatCodeBlock(label, clipped, "text");
-  return asBoolean(truncatedValue) ? `${block}\n(note: ${label} was truncated)` : block;
-}
-
 function getCombinedProcessOutput(record: Record<string, unknown>): string {
   const stdout = readTrimmedString(record.stdout);
   const stderr = readTrimmedString(record.stderr);
@@ -2388,28 +2223,6 @@ function getCombinedProcessOutput(record: Record<string, unknown>): string {
     return `${stdout}\n\n[stderr]\n${stderr}`;
   }
   return stdout || stderr;
-}
-
-function summarizeInstallPipOutput(record: Record<string, unknown>): string {
-  const output = getCombinedProcessOutput(record);
-  if (!output) {
-    return "";
-  }
-  const lines = output
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => line.trim())
-    .filter(Boolean);
-
-  const important = lines.filter((line) =>
-    /successfully installed|requirement already satisfied|no matching distribution found|could not find a version that satisfies|error:/i.test(
-      line,
-    ),
-  );
-  if (important.length > 0) {
-    return important.slice(0, 4).join("\n");
-  }
-  return lines.slice(0, 3).join("\n");
 }
 
 function summarizeInstallJsOutput(record: Record<string, unknown>): string {
@@ -2432,57 +2245,6 @@ function summarizeInstallJsOutput(record: Record<string, unknown>): string {
   return lines.slice(0, 3).join("\n");
 }
 
-function formatCodeBlock(label: string, body: string, language: string): string {
-  const text = body.trim();
-  if (!text) {
-    return "";
-  }
-  const normalizedLanguage = language.trim().toLowerCase().replace(/[^a-z0-9_+-]/g, "");
-  const fence = normalizedLanguage ? `\`\`\`${normalizedLanguage}` : "```";
-  return `${label}:\n${fence}\n${text}\n\`\`\``;
-}
-
-function indentBlock(value: string, indent: string): string {
-  return value
-    .replace(/\r\n/g, "\n")
-    .split("\n")
-    .map((line) => `${indent}${line}`)
-    .join("\n");
-}
-
-function clipBlock(value: string, maxLines: number, maxChars: number): string {
-  const normalized = value.replace(/\r\n/g, "\n");
-  let text = normalized;
-  let truncated = false;
-
-  if (text.length > maxChars) {
-    text = text.slice(0, maxChars);
-    truncated = true;
-  }
-
-  let lines = text.split("\n");
-  const maxLineLength = 220;
-  lines = lines.map((line) => {
-    if (line.length <= maxLineLength) {
-      return line;
-    }
-    truncated = true;
-    return `${line.slice(0, maxLineLength - 3)}...`;
-  });
-
-  if (lines.length > maxLines) {
-    text = lines.slice(0, maxLines).join("\n");
-    truncated = true;
-  } else {
-    text = lines.join("\n");
-  }
-
-  const trimmed = text.trim();
-  if (!trimmed) {
-    return "";
-  }
-  return truncated ? `${trimmed}\n...` : trimmed;
-}
 
 function toStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) {
@@ -2496,10 +2258,6 @@ function toStringArray(value: unknown): string[] {
 
 function readTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
-}
-
-function asBoolean(value: unknown): boolean {
-  return value === true;
 }
 
 function formatInlineJson(value: unknown): string {

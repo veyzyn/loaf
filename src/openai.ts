@@ -1,7 +1,7 @@
 import OpenAI from "openai";
 import { loafConfig, type ThinkingLevel } from "./config.js";
 import { defaultToolRegistry, defaultToolRuntime } from "./tools/index.js";
-import type { ChatMessage, DebugEvent, ModelResult, StreamChunk } from "./vertex.js";
+import type { ChatMessage, DebugEvent, ModelResult, StreamChunk } from "./chat-types.js";
 
 export type OpenAIRequest = {
   accessToken: string;
@@ -11,6 +11,8 @@ export type OpenAIRequest = {
   thinkingLevel: ThinkingLevel;
   includeThoughts: boolean;
   systemInstruction?: string;
+  signal?: AbortSignal;
+  drainSteeringMessages?: () => ChatMessage[];
 };
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
@@ -19,6 +21,7 @@ const OPENAI_MODELS_ORIGINATOR = "codex_cli_rs";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
 const RETRY_MAX_DELAY_MS = 20_000;
+const SAFE_PROVIDER_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
 
 type OpenAiResponse = {
   id?: string;
@@ -131,18 +134,35 @@ export async function runOpenAiInferenceStream(
   const client = createChatgptCodexClient(accessToken, request.chatgptAccountId);
   const systemInstruction = request.systemInstruction?.trim() || loafConfig.systemInstruction;
 
-  const tools = buildToolDeclarations();
+  const toolDeclarations = buildToolDeclarations();
   let conversationInput = messagesToResponsesInput(request.messages);
   const startedAt = Date.now();
   let toolRound = 0;
 
   while (true) {
+    assertNotAborted(request.signal);
+
+    const steeringMessages = request.drainSteeringMessages?.() ?? [];
+    if (steeringMessages.length > 0) {
+      conversationInput = [...conversationInput, ...chatMessagesToResponsesInput(steeringMessages)];
+      onDebug?.({
+        stage: "steer_injected",
+        data: {
+          count: steeringMessages.length,
+          messages: steeringMessages.map((message) => ({
+            role: message.role,
+            preview: message.text.slice(0, 160),
+          })),
+        },
+      });
+    }
+
     toolRound += 1;
     const requestPayload: Record<string, unknown> = {
       model: request.model,
       instructions: systemInstruction,
       input: conversationInput,
-      tools,
+      tools: toolDeclarations.declarations,
       tool_choice: "auto",
       parallel_tool_calls: false,
       store: false,
@@ -167,6 +187,7 @@ export async function runOpenAiInferenceStream(
       toolRound,
       onDebug,
       onChunk,
+      request.signal,
     );
 
     onDebug?.({
@@ -208,25 +229,29 @@ export async function runOpenAiInferenceStream(
       }> = [];
 
       for (let i = 0; i < functionCalls.length; i += 1) {
+        assertNotAborted(request.signal);
         const call = functionCalls[i] ?? {};
-        const callName = String(call.name ?? "").trim();
-        const callId = String(call.call_id ?? `${callName || "tool"}-${toolRound}-${i}`);
+        const providerToolName = String(call.name ?? "").trim();
+        const runtimeToolName =
+          toolDeclarations.providerToRuntimeName.get(providerToolName) ?? providerToolName;
+        const callId = String(call.call_id ?? `${providerToolName || "tool"}-${toolRound}-${i}`);
         const callArgumentsRaw = typeof call.arguments === "string" && call.arguments.trim() ? call.arguments : "{}";
         const callArgs = safeParseObject(callArgumentsRaw);
 
         const toolResult = await defaultToolRuntime.execute(
           {
             id: callId,
-            name: callName,
+            name: runtimeToolName,
             input: callArgs as never,
           },
           {
             now: new Date(),
+            signal: request.signal,
           },
         );
 
         executed.push({
-          name: callName,
+          name: runtimeToolName,
           ok: toolResult.ok,
           input: callArgs,
           result: toolResult.output,
@@ -245,7 +270,7 @@ export async function runOpenAiInferenceStream(
         replayFunctionCalls.push({
           type: "function_call",
           call_id: callId,
-          name: callName,
+          name: providerToolName,
           arguments: callArgumentsRaw,
         });
       }
@@ -327,17 +352,26 @@ function buildFunctionCallFollowUpInput(
   return [...functionCalls, ...functionOutputs];
 }
 
-function buildToolDeclarations(): Array<Record<string, unknown>> {
-  return defaultToolRegistry.list().map((tool) => {
+function buildToolDeclarations(): {
+  declarations: Array<Record<string, unknown>>;
+  providerToRuntimeName: Map<string, string>;
+} {
+  const declarations: Array<Record<string, unknown>> = [];
+  const providerToRuntimeName = new Map<string, string>();
+  const usedProviderNames = new Set<string>();
+
+  for (const tool of defaultToolRegistry.list()) {
     const schema = tool.inputSchema ?? {
       type: "object",
       properties: {},
       required: [],
     };
 
-    return {
+    const providerName = toProviderToolName(tool.name, usedProviderNames);
+    providerToRuntimeName.set(providerName, tool.name);
+    declarations.push({
       type: "function",
-      name: tool.name,
+      name: providerName,
       description: tool.description,
       parameters: {
         type: schema.type,
@@ -346,8 +380,46 @@ function buildToolDeclarations(): Array<Record<string, unknown>> {
         additionalProperties: false,
       },
       strict: false,
-    };
-  });
+    });
+  }
+
+  return {
+    declarations,
+    providerToRuntimeName,
+  };
+}
+
+function toProviderToolName(runtimeName: string, usedNames: Set<string>): string {
+  const baseName = runtimeName.trim() || "tool";
+  let candidate = SAFE_PROVIDER_TOOL_NAME_PATTERN.test(baseName)
+    ? baseName
+    : baseName
+        .replace(/[^a-zA-Z0-9_-]+/g, "_")
+        .replace(/_+/g, "_")
+        .replace(/^_+|_+$/g, "");
+
+  if (!candidate) {
+    candidate = "tool";
+  }
+  if (!/^[a-zA-Z_]/.test(candidate)) {
+    candidate = `tool_${candidate}`;
+  }
+  if (candidate.length > 64) {
+    candidate = candidate.slice(0, 64).replace(/_+$/g, "");
+    if (!candidate) {
+      candidate = "tool";
+    }
+  }
+
+  let uniqueName = candidate;
+  let suffix = 2;
+  while (usedNames.has(uniqueName)) {
+    const suffixText = `_${suffix++}`;
+    const maxBaseLength = Math.max(1, 64 - suffixText.length);
+    uniqueName = `${candidate.slice(0, maxBaseLength)}${suffixText}`;
+  }
+  usedNames.add(uniqueName);
+  return uniqueName;
 }
 
 function messagesToResponsesInput(messages: ChatMessage[]): Array<Record<string, unknown>> {
@@ -361,6 +433,14 @@ function messagesToResponsesInput(messages: ChatMessage[]): Array<Record<string,
     ];
   }
 
+  return messages.map((message) => ({
+    type: "message",
+    role: message.role,
+    content: message.text,
+  }));
+}
+
+function chatMessagesToResponsesInput(messages: ChatMessage[]): Array<Record<string, unknown>> {
   return messages.map((message) => ({
     type: "message",
     role: message.role,
@@ -424,13 +504,18 @@ async function createResponseWithRetry(
   toolRound: number,
   onDebug?: (event: DebugEvent) => void,
   onChunk?: (chunk: StreamChunk) => void,
+  signal?: AbortSignal,
 ): Promise<OpenAiResponse> {
   let attempt = 0;
   while (true) {
+    assertNotAborted(signal);
     attempt += 1;
     try {
-      return await createStreamedResponse(client, requestPayload, toolRound, onDebug, onChunk);
+      return await createStreamedResponse(client, requestPayload, toolRound, onDebug, onChunk, signal);
     } catch (error) {
+      if (isAbortError(error)) {
+        throw error;
+      }
       const retryable = isRetryable429Error(error);
       if (!retryable || attempt >= MAX_429_RETRY_ATTEMPTS) {
         throw error;
@@ -447,7 +532,7 @@ async function createResponseWithRetry(
           error: summarizeError(error),
         },
       });
-      await sleep(delayMs);
+      await sleep(delayMs, signal);
     }
   }
 }
@@ -458,14 +543,19 @@ async function createStreamedResponse(
   toolRound: number,
   onDebug?: (event: DebugEvent) => void,
   onChunk?: (chunk: StreamChunk) => void,
+  signal?: AbortSignal,
 ): Promise<OpenAiResponse> {
-  const stream = client.responses.stream(requestPayload as never);
+  assertNotAborted(signal);
+  const stream = signal
+    ? client.responses.stream(requestPayload as never, { signal } as never)
+    : client.responses.stream(requestPayload as never);
   let eventCount = 0;
   let outputDeltaChars = 0;
   let reasoningDeltaChars = 0;
   let reasoningBuffer = "";
 
   for await (const event of stream) {
+    assertNotAborted(signal);
     eventCount += 1;
 
     if (event.type === "response.output_text.delta") {
@@ -551,10 +641,39 @@ function computeRetryDelayMs(attempt: number): number {
   return Math.max(250, Math.floor(capped + jitter));
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  assertNotAborted(signal);
+  return new Promise((resolve, reject) => {
+    const handle = setTimeout(() => {
+      cleanup();
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(handle);
+      cleanup();
+      reject(createAbortError());
+    };
+    const cleanup = () => {
+      signal?.removeEventListener("abort", onAbort);
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function assertNotAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw createAbortError();
+  }
+}
+
+function createAbortError(): Error {
+  const error = new Error("Request interrupted by user.");
+  error.name = "AbortError";
+  return error;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 function summarizeError(error: unknown): string {

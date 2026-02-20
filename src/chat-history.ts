@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { AuthProvider, ThinkingLevel } from "./config.js";
 import { getLoafDataDir } from "./persistence.js";
-import type { ChatMessage } from "./vertex.js";
+import type { ChatMessage } from "./chat-types.js";
 
 const SESSIONS_DIR = path.join(getLoafDataDir(), "sessions");
 const SESSION_FILE_PREFIX = "rollout-";

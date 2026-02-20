@@ -8,6 +8,8 @@ Loaf auto-loads custom tools at startup and registers them into the same tool re
 
 If a custom tool is valid, it appears in `/tools` and can be called by the model.
 
+You can also have the model create tools for you by calling the built-in `create_persistent_tool`.
+
 ## Tool Folders
 
 Loaf discovers tools only from:

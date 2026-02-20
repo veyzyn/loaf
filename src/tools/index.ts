@@ -1,5 +1,6 @@
 import { loafConfig } from "../config.js";
 import { createExaBuiltinTools } from "./builtin/exa.js";
+import { createPersistentToolTool } from "./builtin/persistent-tool.js";
 import { discoverCustomTools } from "./custom.js";
 import { JAVASCRIPT_BUILTIN_TOOLS } from "./builtin/javascript.js";
 import { createToolRegistry } from "./registry.js";
@@ -15,9 +16,19 @@ const EXA_BUILTIN_TOOLS = createExaBuiltinTools({
   getApiKey: () => configuredExaApiKey || loafConfig.exaApiKey,
 });
 
-export const defaultToolRegistry = createToolRegistry()
+const registry = createToolRegistry()
   .registerMany(JAVASCRIPT_BUILTIN_TOOLS)
   .registerMany(EXA_BUILTIN_TOOLS);
+let builtinToolNames = new Set(registry.list().map((tool) => tool.name));
+registry.register(
+  createPersistentToolTool({
+    registry,
+    isBuiltinToolName: (name) => builtinToolNames.has(name),
+  }),
+);
+builtinToolNames = new Set(registry.list().map((tool) => tool.name));
+
+export const defaultToolRegistry = registry;
 
 export const defaultToolRuntime = new ToolRuntime(defaultToolRegistry);
 

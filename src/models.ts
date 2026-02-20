@@ -38,7 +38,6 @@ type ModelsCacheFile = {
   version: 1;
   openai?: CachedProviderModels;
   openrouter?: CachedProviderModels;
-  vertex?: CachedProviderModels;
 };
 
 const MODEL_CACHE_FILE_PATH = path.join(getLoafDataDir(), "models-cache.json");
@@ -430,7 +429,7 @@ function readCachedProviderModels(provider: AuthProvider, requireFresh: boolean)
   const entry =
     provider === "openai"
       ? cache.openai
-      : cache.openrouter ?? cache.vertex;
+      : cache.openrouter;
   if (!entry || !Array.isArray(entry.models) || !entry.fetchedAt) {
     return [];
   }
@@ -530,7 +529,6 @@ function writeCachedProviderModels(provider: AuthProvider, models: ModelOption[]
     version: 1,
     openai: existing.openai,
     openrouter: existing.openrouter,
-    vertex: existing.vertex,
   };
   if (provider === "openai") {
     nextCache.openai = nextEntry;

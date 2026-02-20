@@ -10,7 +10,7 @@ import type {
 } from "./types.js";
 
 const SUPPORTED_TOOL_FILE_EXTENSIONS = new Set([".js", ".mjs", ".cjs"]);
-const TOOL_NAME_PATTERN = /^[a-zA-Z0-9_.:-]+$/;
+export const CUSTOM_TOOL_NAME_PATTERN = /^[a-zA-Z0-9_.:-]+$/;
 
 type RawToolRunner = (input: ToolInput, context: unknown) => Promise<unknown> | unknown;
 
@@ -31,6 +31,37 @@ export type CustomToolsDiscoveryResult = {
   errors: string[];
 };
 
+export type LoadedCustomToolFile = {
+  name: string;
+  sourcePath: string;
+  tool: ToolDefinition;
+};
+
+export async function loadCustomToolFile(filePath: string): Promise<LoadedCustomToolFile | null> {
+  const extension = path.extname(filePath).toLowerCase();
+  if (!SUPPORTED_TOOL_FILE_EXTENSIONS.has(extension)) {
+    return null;
+  }
+
+  const moduleUrl = `${pathToFileURL(filePath).href}?t=${Date.now()}`;
+  const moduleExports = (await import(moduleUrl)) as Record<string, unknown>;
+  const resolved = resolveToolCandidate(moduleExports, filePath);
+  if (!resolved) {
+    return null;
+  }
+  if (!isValidCustomToolName(resolved.name)) {
+    throw new Error(
+      `invalid tool name "${resolved.name}" (allowed: letters, numbers, _ . : -)`,
+    );
+  }
+
+  return {
+    name: resolved.name,
+    sourcePath: filePath,
+    tool: toToolDefinition(resolved),
+  };
+}
+
 export async function discoverCustomTools(): Promise<CustomToolsDiscoveryResult> {
   const searchedDirectories = resolveToolDirectories();
   const loaded: CustomToolsDiscoveryResult["loaded"] = [];
@@ -44,24 +75,12 @@ export async function discoverCustomTools(): Promise<CustomToolsDiscoveryResult>
     const files = listToolFiles(directory);
     for (const filePath of files) {
       try {
-        const moduleUrl = `${pathToFileURL(filePath).href}?t=${Date.now()}`;
-        const moduleExports = (await import(moduleUrl)) as Record<string, unknown>;
-        const resolved = resolveToolCandidate(moduleExports, filePath);
-        if (!resolved) {
+        const parsed = await loadCustomToolFile(filePath);
+        if (!parsed) {
           errors.push(`skipped ${filePath}: no valid tool export found`);
           continue;
         }
-        if (!TOOL_NAME_PATTERN.test(resolved.name)) {
-          errors.push(
-            `skipped ${filePath}: invalid tool name "${resolved.name}" (allowed: letters, numbers, _ . : -)`,
-          );
-          continue;
-        }
-        loaded.push({
-          name: resolved.name,
-          sourcePath: filePath,
-          tool: toToolDefinition(resolved),
-        });
+        loaded.push(parsed);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         errors.push(`failed loading ${filePath}: ${message}`);
@@ -77,7 +96,11 @@ export async function discoverCustomTools(): Promise<CustomToolsDiscoveryResult>
 }
 
 function resolveToolDirectories(): string[] {
-  return [path.join(getLoafDataDir(), "tools")];
+  return [getCustomToolsDirectory()];
+}
+
+export function getCustomToolsDirectory(): string {
+  return path.join(getLoafDataDir(), "tools");
 }
 
 function listToolFiles(rootDir: string): string[] {
@@ -270,4 +293,8 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function readTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+export function isValidCustomToolName(name: string): boolean {
+  return CUSTOM_TOOL_NAME_PATTERN.test(name);
 }

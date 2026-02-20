@@ -26,6 +26,11 @@ export class ToolRegistry {
     return this.tools.has(name);
   }
 
+  unregister(name: string): this {
+    this.tools.delete(name);
+    return this;
+  }
+
   list(): ToolDefinition[] {
     return [...this.tools.values()].sort((a, b) => a.name.localeCompare(b.name));
   }
