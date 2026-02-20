@@ -18,12 +18,12 @@ a terminal-first ai assistant cli built with ink + react.
   - searchable model picker
   - thinking level picker
   - openrouter provider routing picker (`any` + forced providers when available)
-- python-first tool runtime:
-  - `run_py`
-  - `install_pip`
-  - `run_py_module`
+- javascript-first tool runtime:
+  - `run_js`
+  - `install_js_packages`
+  - `run_js_module`
 - optional web search tool via exa (`search_web`) with highlights
-- browser automation tools (playwright-backed)
+- custom js tool loading from user folders
 - automatic conversation reset when switching model providers
 
 ## quick start
@@ -54,15 +54,21 @@ no env vars are required for normal use.
 
 ## local data
 
-on windows, state is persisted under `%APPDATA%\loaf\`:
+loaf persists data in a single home directory:
+
+- macos/linux: `~/.loaf`
+- windows: `%USERPROFILE%\.loaf`
 
 - `state.json` selected model/thinking/auth, input history, onboarding state
 - `auth.json` openai oauth token bundle
 - `models-cache.json` provider model cache
 - `sessions/YYYY/MM/DD/rollout-*.jsonl` saved chat sessions (used by `/history`)
-- `python-runtime/` managed python runtime + venv + transient scripts
+- `js-runtime/` transient js scripts created by `run_js`
+- `tools/` user-provided js tools (auto-loaded)
 
 ## notes
 
 - search guidance is only injected when exa is configured.
 - tools live in `src/tools/`.
+- custom tools are discovered only from `<loaf data dir>/tools`.
+- detailed custom tool docs: `CUSTOM_TOOLS.md`

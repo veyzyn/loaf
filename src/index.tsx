@@ -29,8 +29,7 @@ import {
 } from "./models.js";
 import { runOpenAiInferenceStream } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
-import { ensurePythonRuntime } from "./python-runtime.js";
-import { configureBuiltinTools, defaultToolRegistry } from "./tools/index.js";
+import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
 import type { ChatMessage, DebugEvent } from "./vertex.js";
 
 type UiMessage = {
@@ -209,11 +208,12 @@ const SEARCH_WEB_PROMPT_EXTENSION = [
   "for facts that may be stale/uncertain (dates, releases, pricing, availability, docs), proactively use search_web.",
   "prefer at least one search_web pass before answering factual questions from memory.",
   "if search results are weak or conflicting, refine the query and search_web again before switching tools.",
-  "for factual web lookups, call search_web first and use returned highlights before writing python scrapers.",
+  "for factual web lookups, call search_web first and use returned highlights before writing custom scrapers.",
 ].join("\n");
 
 function App() {
   const { exit } = useApp();
+  const exitShortcutLabel = getExitShortcutLabel();
   const initialModelOptionsByProvider = useMemo(
     () =>
       ({
@@ -1729,7 +1729,7 @@ function App() {
           showCursor
         />
       </Box>
-      <Text color="gray">ctrl+c exit | /help for commands</Text>
+      <Text color="gray">{exitShortcutLabel} exit | /help for commands</Text>
     </Box>
   );
 }
@@ -1780,7 +1780,15 @@ function formatToolRows(data: unknown): string[] {
 }
 
 function shouldCollapseSuccessDetail(name: string): boolean {
-  return name !== "install_pip" && name !== "run_py" && name !== "run_py_module" && name !== "search_web";
+  return (
+    name !== "install_pip" &&
+    name !== "run_py" &&
+    name !== "run_py_module" &&
+    name !== "install_js_packages" &&
+    name !== "run_js" &&
+    name !== "run_js_module" &&
+    name !== "search_web"
+  );
 }
 
 function formatToolRow(summary: string, detail: string): string {
@@ -1803,8 +1811,20 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
     return "installed python package(s)";
   }
 
+  if (name === "install_js_packages") {
+    const packages = getJavaScriptPackages(payload, result);
+    if (packages.length > 0) {
+      return `installed ${packages.length} package(s)`;
+    }
+    return "installed javascript package(s)";
+  }
+
   if (name === "run_py") {
     return "executed python script";
+  }
+
+  if (name === "run_js") {
+    return "executed javascript script";
   }
 
   if (name === "run_py_module") {
@@ -1814,6 +1834,15 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
       return `ran python module ${moduleName}`;
     }
     return "ran python module";
+  }
+
+  if (name === "run_js_module") {
+    const record = isRecord(result) ? result : {};
+    const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
+    if (moduleName) {
+      return `ran javascript module ${moduleName}`;
+    }
+    return "ran javascript module";
   }
 
   if (name === "search_web") {
@@ -1974,12 +2003,24 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
     return formatWithStatus(formatInstallPipDetail(payload, record));
   }
 
+  if (name === "install_js_packages") {
+    return formatWithStatus(formatInstallJsPackagesDetail(payload, record));
+  }
+
   if (name === "run_py") {
     return formatWithStatus(formatRunPyDetail(payload, record));
   }
 
+  if (name === "run_js") {
+    return formatWithStatus(formatRunJsDetail(payload, record));
+  }
+
   if (name === "run_py_module") {
     return formatWithStatus(formatRunPyModuleDetail(payload, record));
+  }
+
+  if (name === "run_js_module") {
+    return formatWithStatus(formatRunJsModuleDetail(payload, record));
   }
 
   if (name === "search_web") {
@@ -2177,6 +2218,11 @@ function getPythonPackages(payload: Record<string, unknown>, result: unknown): s
   return toStringArray(record.packages ?? payload.packages);
 }
 
+function getJavaScriptPackages(payload: Record<string, unknown>, result: unknown): string[] {
+  const record = isRecord(result) ? result : {};
+  return toStringArray(record.packages ?? payload.packages);
+}
+
 function formatInstallPipDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
   const packages = getPythonPackages(payload, record);
   const packageSummary =
@@ -2187,6 +2233,28 @@ function formatInstallPipDetail(payload: Record<string, unknown>, record: Record
       : "packages";
 
   const outcome = summarizeInstallPipOutput(record);
+  if (outcome) {
+    const firstLine = outcome
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    return firstLine ? `${packageSummary} | ${clipInline(firstLine, 140)}` : packageSummary;
+  }
+
+  return packageSummary;
+}
+
+function formatInstallJsPackagesDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const packages = getJavaScriptPackages(payload, record);
+  const packageSummary =
+    packages.length > 0
+      ? packages.length <= 3
+        ? packages.join(", ")
+        : `${packages.slice(0, 3).join(", ")}, +${packages.length - 3} more`
+      : "packages";
+
+  const outcome = summarizeInstallJsOutput(record);
   if (outcome) {
     const firstLine = outcome
       .replace(/\r\n/g, "\n")
@@ -2214,7 +2282,40 @@ function formatRunPyDetail(payload: Record<string, unknown>, record: Record<stri
   return "no stdout/stderr";
 }
 
+function formatRunJsDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const output = getCombinedProcessOutput(record);
+  if (output) {
+    const firstLine = output
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) {
+      return clipInline(firstLine, 180);
+    }
+  }
+  return "no stdout/stderr";
+}
+
 function formatRunPyModuleDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
+  const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
+  const modulePrefix = moduleName ? `${moduleName} | ` : "";
+
+  const output = getCombinedProcessOutput(record);
+  if (output) {
+    const firstLine = output
+      .replace(/\r\n/g, "\n")
+      .split("\n")
+      .map((line) => line.trim())
+      .find(Boolean);
+    if (firstLine) {
+      return `${modulePrefix}${clipInline(firstLine, 180)}`;
+    }
+  }
+  return `${modulePrefix}no stdout/stderr`.trim();
+}
+
+function formatRunJsModuleDetail(payload: Record<string, unknown>, record: Record<string, unknown>): string {
   const moduleName = readTrimmedString(record.module) || readTrimmedString(payload.module);
   const modulePrefix = moduleName ? `${moduleName} | ` : "";
 
@@ -2304,6 +2405,26 @@ function summarizeInstallPipOutput(record: Record<string, unknown>): string {
     /successfully installed|requirement already satisfied|no matching distribution found|could not find a version that satisfies|error:/i.test(
       line,
     ),
+  );
+  if (important.length > 0) {
+    return important.slice(0, 4).join("\n");
+  }
+  return lines.slice(0, 3).join("\n");
+}
+
+function summarizeInstallJsOutput(record: Record<string, unknown>): string {
+  const output = getCombinedProcessOutput(record);
+  if (!output) {
+    return "";
+  }
+  const lines = output
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+
+  const important = lines.filter((line) =>
+    /added|installed|up to date|already up-to-date|done in|error|err!/i.test(line),
   );
   if (important.length > 0) {
     return important.slice(0, 4).join("\n");
@@ -2430,6 +2551,16 @@ function formatSessionTimestamp(value: string): string {
     hour: "numeric",
     minute: "2-digit",
   });
+}
+
+function getExitShortcutLabel(): string {
+  if (process.platform === "darwin") {
+    return "\u2303C";
+  }
+  if (process.platform === "win32") {
+    return "ctrl+c";
+  }
+  return "control+c";
 }
 
 function parseThoughtTitle(rawThought: string): string {
@@ -2937,21 +3068,17 @@ void startApp();
 
 async function startApp(): Promise<void> {
   try {
-    const runtime = await ensurePythonRuntime();
-    const setupNotes: string[] = [];
-    if (runtime.installedByBootstrap) {
-      setupNotes.push("python installed");
+    const customTools = await loadCustomTools();
+    if (customTools.loaded.length > 0) {
+      const names = customTools.loaded.map((tool) => tool.name).join(", ");
+      console.log(`[loaf] loaded ${customTools.loaded.length} custom tool(s): ${names}`);
     }
-    if (runtime.createdVenv) {
-      setupNotes.push("venv created");
+    for (const error of customTools.errors) {
+      console.warn(`[loaf] custom tool warning: ${error}`);
     }
-    const suffix = setupNotes.length > 0 ? ` (${setupNotes.join(", ")})` : "";
-    console.log(`[loaf] python runtime ready: ${runtime.pythonExecutable}${suffix}`);
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
-    console.error(`[loaf] python bootstrap failed: ${message}`);
-    process.exitCode = 1;
-    return;
+    console.warn(`[loaf] custom tools initialization failed: ${message}`);
   }
 
   render(<App />);

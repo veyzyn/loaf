@@ -17,6 +17,9 @@ export type LoafPersistedState = {
   updatedAt?: string;
 };
 
+const CURRENT_LOAF_DATA_DIR = path.join(os.homedir(), ".loaf");
+const LEGACY_LOAF_DATA_DIR = getLegacyLoafDataDir();
+let migrationChecked = false;
 const STATE_FILE_PATH = getStateFilePath();
 const LEGACY_STATE_FILE_PATH = path.resolve(process.cwd(), ".loaf-state.json");
 const MAX_HISTORY_ITEMS = 200;
@@ -206,8 +209,8 @@ function getStateFilePath(): string {
 }
 
 export function getLoafDataDir(): string {
-  const baseDir = getStateBaseDir();
-  return path.join(baseDir, "loaf");
+  ensureLoafDataDirMigration();
+  return CURRENT_LOAF_DATA_DIR;
 }
 
 export function clearPersistedConfig(): void {
@@ -237,7 +240,7 @@ export function clearPersistedConfig(): void {
   }
 }
 
-function getStateBaseDir(): string {
+function getLegacyStateBaseDir(): string {
   if (process.platform === "win32") {
     const appData = process.env.APPDATA?.trim();
     if (appData) {
@@ -261,4 +264,41 @@ function getStateBaseDir(): string {
   }
 
   return path.join(home, ".local", "state");
+}
+
+function getLegacyLoafDataDir(): string {
+  return path.join(getLegacyStateBaseDir(), "loaf");
+}
+
+function ensureLoafDataDirMigration(): void {
+  if (migrationChecked) {
+    return;
+  }
+  migrationChecked = true;
+
+  try {
+    if (fs.existsSync(CURRENT_LOAF_DATA_DIR)) {
+      return;
+    }
+    if (!fs.existsSync(LEGACY_LOAF_DATA_DIR)) {
+      return;
+    }
+
+    try {
+      fs.renameSync(LEGACY_LOAF_DATA_DIR, CURRENT_LOAF_DATA_DIR);
+      return;
+    } catch {
+      // fall back to copy-on-failure, e.g. cross-device rename
+    }
+
+    fs.mkdirSync(CURRENT_LOAF_DATA_DIR, { recursive: true });
+    fs.cpSync(LEGACY_LOAF_DATA_DIR, CURRENT_LOAF_DATA_DIR, { recursive: true });
+    try {
+      fs.rmSync(LEGACY_LOAF_DATA_DIR, { recursive: true, force: true });
+    } catch {
+      // best-effort cleanup
+    }
+  } catch {
+    // best-effort migration
+  }
 }
