@@ -24,7 +24,7 @@ export type OpenRouterModelCandidate = {
 };
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
-const OPENROUTER_HTTP_REFERER = "https://github.com/crabmiau/loaf";
+const OPENROUTER_HTTP_REFERER = "https://github.com/veyzyn/loaf";
 const OPENROUTER_X_TITLE = "loaf";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
