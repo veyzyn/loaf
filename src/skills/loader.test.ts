@@ -67,7 +67,7 @@ describe("loadSkillsCatalog", () => {
     expect(catalog.errors[0]).toContain("empty skill content");
   });
 
-  it("reports read failures when SKILL.md exists as a directory", () => {
+  it("ignores directories named SKILL.md", () => {
     const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-read-error-"));
     tempDirs.push(rootDir);
 
@@ -77,8 +77,7 @@ describe("loadSkillsCatalog", () => {
     const catalog = loadSkillsCatalog(rootDir);
     expect(catalog.directories).toEqual([rootDir]);
     expect(catalog.skills).toEqual([]);
-    expect(catalog.errors).toHaveLength(1);
-    expect(catalog.errors[0]).toContain("failed reading");
+    expect(catalog.errors).toEqual([]);
   });
 
   it("reports directory read failures", () => {
@@ -126,7 +125,7 @@ describe("loadSkillsCatalog", () => {
     expect(catalog.errors[0]).toContain("read failed");
   });
 
-  it("loads from multiple directories and skips duplicate skill names", () => {
+  it("loads from multiple directories and keeps duplicate skill names with distinct paths", () => {
     const primaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-primary-"));
     const secondaryDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-secondary-"));
     tempDirs.push(primaryDir, secondaryDir);
@@ -146,9 +145,30 @@ describe("loadSkillsCatalog", () => {
     const catalog = loadSkillsCatalog([primaryDir, secondaryDir]);
 
     expect(catalog.directories).toEqual([primaryDir, secondaryDir]);
-    expect(catalog.skills.map((skill) => skill.name)).toEqual(["alpha", "beta"]);
-    expect(catalog.skills.find((skill) => skill.name === "alpha")?.sourcePath).toContain(primaryDir);
-    expect(catalog.errors.some((error) => error.includes('duplicate skill name "alpha"'))).toBe(true);
+    expect(catalog.skills.map((skill) => skill.name)).toEqual(["alpha", "alpha", "beta"]);
+    const alphaPaths = catalog.skills
+      .filter((skill) => skill.name === "alpha")
+      .map((skill) => skill.sourcePath);
+    expect(alphaPaths).toHaveLength(2);
+    expect(alphaPaths.some((sourcePath) => sourcePath.includes(primaryDir))).toBe(true);
+    expect(alphaPaths.some((sourcePath) => sourcePath.includes(secondaryDir))).toBe(true);
+    expect(catalog.errors).toEqual([]);
+  });
+
+  it("recursively discovers SKILL.md files under nested directories", () => {
+    const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), "loaf-skills-nested-"));
+    tempDirs.push(rootDir);
+
+    const nestedSkillDir = path.join(rootDir, "team", "frontend", "web-design-guidelines");
+    fs.mkdirSync(nestedSkillDir, { recursive: true });
+    fs.writeFileSync(path.join(nestedSkillDir, "SKILL.md"), "# Title\n\nnested skill", "utf8");
+
+    const catalog = loadSkillsCatalog(rootDir);
+
+    expect(catalog.skills).toHaveLength(1);
+    expect(catalog.skills[0]?.name).toBe("web-design-guidelines");
+    expect(catalog.skills[0]?.sourcePath).toContain(path.join("team", "frontend", "web-design-guidelines", "SKILL.md"));
+    expect(catalog.errors).toEqual([]);
   });
 });
 
