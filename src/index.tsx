@@ -1193,7 +1193,15 @@ function App() {
   };
 
   useInput((character, key) => {
-    if (key.ctrl && character === "c") {
+    const isCtrlC = key.ctrl && (character === "c" || character === "");
+    if (isCtrlC) {
+      if (input.length > 0) {
+        setInput("");
+        setInputHistoryIndex(null);
+        setInputHistoryDraft("");
+        setAutocompletedSkillPrefix(null);
+        return;
+      }
       exit();
       return;
     }
@@ -2045,7 +2053,7 @@ function App() {
       </Box>
       <Text color="gray">
         {pending ? "esc interrupt | enter to steer | " : ""}
-        {exitShortcutLabel} exit | /help for commands
+        {exitShortcutLabel} clear (exit when empty) | /help for commands
       </Text>
     </Box>
   );
@@ -3044,5 +3052,5 @@ async function startApp(): Promise<void> {
     console.warn(`[loaf] custom tools initialization failed: ${message}`);
   }
 
-  render(<App />);
+  render(<App />, { exitOnCtrlC: false });
 }
