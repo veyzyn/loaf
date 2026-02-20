@@ -38,6 +38,7 @@ npm run dev
 - `/onboarding` rerun setup flow
 - `/forgeteverything` wipe local config and restart onboarding
 - `/model` choose model, thinking level, and (for openrouter) routing provider
+- `/history` list/resume saved chats (`/history`, `/history last`, `/history <id>`)
 - `/tools` list registered tools
 - `/clear` clear conversation messages
 - `/help` show command list
@@ -57,6 +58,7 @@ on windows, state is persisted under `%APPDATA%\loaf\`:
 - `state.json` selected model/thinking/auth, input history, onboarding state
 - `auth.json` openai oauth token bundle
 - `models-cache.json` provider model cache
+- `sessions/YYYY/MM/DD/rollout-*.jsonl` saved chat sessions (used by `/history`)
 - `python-runtime/` managed python runtime + venv + transient scripts
 
 ## notes

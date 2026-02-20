@@ -10,6 +10,16 @@ import {
 } from "./persistence.js";
 import { getPersistedOpenAiChatgptAuth, runOpenAiOauthLogin } from "./openai-oauth.js";
 import {
+  createChatSession,
+  listChatSessions,
+  loadChatSession,
+  loadChatSessionById,
+  loadLatestChatSession,
+  type ChatSessionRecord,
+  type ChatSessionSummary,
+  writeChatSession,
+} from "./chat-history.js";
+import {
   discoverOpenAiModelOptions,
   discoverOpenRouterModelOptions,
   getDefaultModelOptionsForProvider,
@@ -50,6 +60,13 @@ type OpenRouterProviderOption = {
 type CommandOption = {
   name: string;
   description: string;
+};
+
+type HistoryOption = {
+  id: string;
+  label: string;
+  description: string;
+  session: ChatSessionSummary;
 };
 
 type OnboardingOption = {
@@ -106,6 +123,12 @@ type SelectorState =
       modelProvider: AuthProvider;
       thinkingLevel: ThinkingLevel;
       options: OpenRouterProviderOption[];
+    }
+  | {
+      kind: "history";
+      title: string;
+      index: number;
+      options: HistoryOption[];
     };
 
 const AUTH_OPTIONS: AuthOption[] = [
@@ -152,6 +175,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/onboarding", description: "open setup flow (auth + exa key)" },
   { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
   { name: "/model", description: "choose model and thinking level" },
+  { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
   { name: "/help", description: "show available commands" },
@@ -231,6 +255,7 @@ function App() {
   const [selector, setSelector] = useState<SelectorState | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
   const [history, setHistory] = useState<ChatMessage[]>([]);
+  const [activeSession, setActiveSession] = useState<ChatSessionSummary | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>(initialInputHistory);
   const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
   const [inputHistoryDraft, setInputHistoryDraft] = useState("");
@@ -609,7 +634,9 @@ function App() {
 
   const getSelectorAllOptions = (
     currentSelector: SelectorState,
-  ): Array<AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption> => {
+  ): Array<
+    AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption | HistoryOption
+  > => {
     if (currentSelector.kind === "openrouter_api_key" || currentSelector.kind === "exa_api_key") {
       return [];
     }
@@ -620,7 +647,9 @@ function App() {
   };
 
   const getSelectorOptionWindow = (
-    options: Array<AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption>,
+    options: Array<
+      AuthOption | ModelOption | ThinkingOption | OpenRouterProviderOption | OnboardingOption | HistoryOption
+    >,
     index: number,
   ) => {
     const WINDOW_SIZE = 10;
@@ -669,6 +698,7 @@ function App() {
         nextMessageId,
       });
       setConversationProvider(null);
+      setActiveSession(null);
     }
 
     const providerSuffix =
@@ -682,11 +712,118 @@ function App() {
     setSelector(null);
   };
 
-  const applyCommand = (rawCommand: string) => {
-    const command = rawCommand.trim().toLowerCase();
-    if (!command) {
+  const openHistorySelector = () => {
+    const sessions = listChatSessions({ limit: 100 });
+    if (sessions.length === 0) {
+      appendSystemMessage("no saved chat history yet.");
       return;
     }
+
+    const options: HistoryOption[] = sessions.map((session) => ({
+      id: session.id,
+      label: session.title,
+      description:
+        `${session.provider} | ${modelIdToLabel(session.model).toLowerCase()} | ` +
+        `${session.messageCount} msgs | ${formatSessionTimestamp(session.updatedAt)} | ${session.id.slice(0, 8)}`,
+      session,
+    }));
+
+    setInput("");
+    setSelector({
+      kind: "history",
+      title: "resume chat history",
+      index: 0,
+      options,
+    });
+  };
+
+  const resumeSession = (session: ChatSessionRecord) => {
+    if (!enabledProviders.includes(session.provider)) {
+      setEnabledProviders((current) => dedupeAuthProviders([...current, session.provider]));
+    }
+
+    setSelectedModel(session.model);
+    setSelectedThinking(
+      normalizeThinkingForModel(
+        session.model,
+        session.provider,
+        session.thinkingLevel,
+        modelOptionsByProvider,
+      ),
+    );
+    if (session.provider === "openrouter") {
+      setSelectedOpenRouterProvider(
+        normalizeOpenRouterProviderSelection(session.openRouterProvider) || OPENROUTER_PROVIDER_ANY_ID,
+      );
+    }
+
+    setHistory(session.messages);
+    setMessages(chatHistoryToUiMessages(session.messages, nextMessageId));
+    setConversationProvider(session.provider);
+    setActiveSession({
+      id: session.id,
+      title: session.title,
+      provider: session.provider,
+      model: session.model,
+      thinkingLevel: session.thinkingLevel,
+      openRouterProvider: session.openRouterProvider,
+      createdAt: session.createdAt,
+      updatedAt: session.updatedAt,
+      messageCount: session.messageCount,
+      rolloutPath: session.rolloutPath,
+    });
+    setSelector(null);
+    setInput("");
+
+    appendSystemMessage(
+      `resumed chat ${session.id.slice(0, 8)} (${session.provider}, ${session.messageCount} msgs).`,
+    );
+
+    if (session.provider === "openai" && !openAiAccessToken.trim()) {
+      appendSystemMessage("this chat uses openai. run /auth before sending the next prompt.");
+    }
+    if (session.provider === "openrouter" && !openRouterApiKey.trim()) {
+      appendSystemMessage("this chat uses openrouter. run /auth before sending the next prompt.");
+    }
+  };
+
+  const runHistoryCommand = (args: string[]) => {
+    if (args.length === 0 || args[0] === "list" || args[0] === "all") {
+      openHistorySelector();
+      return;
+    }
+
+    const first = args[0]!.toLowerCase();
+    if (first === "last") {
+      const latest = loadLatestChatSession();
+      if (!latest) {
+        appendSystemMessage("no saved chat history yet.");
+        return;
+      }
+      resumeSession(latest);
+      return;
+    }
+
+    const byId = loadChatSessionById(args[0]!);
+    if (!byId) {
+      appendSystemMessage(`no saved chat matched id: ${args[0]}`);
+      openHistorySelector();
+      return;
+    }
+    resumeSession(byId);
+  };
+
+  const applyCommand = (rawCommand: string) => {
+    const trimmed = rawCommand.trim();
+    if (!trimmed) {
+      return;
+    }
+    const tokens = trimmed.split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) {
+      return;
+    }
+    const command = tokens[0]!.toLowerCase();
+    const args = tokens.slice(1);
 
     if (command === "/auth") {
       openAuthSelector(false);
@@ -713,6 +850,7 @@ function App() {
       setStatusLabel("ready");
       setConversationProvider(null);
       setHistory([]);
+      setActiveSession(null);
       setInputHistory([]);
       setInputHistoryIndex(null);
       setInputHistoryDraft("");
@@ -739,10 +877,16 @@ function App() {
       return;
     }
 
+    if (command === "/history") {
+      runHistoryCommand(args);
+      return;
+    }
+
     if (command === "/clear") {
       setMessages([]);
       setHistory([]);
       setConversationProvider(null);
+      setActiveSession(null);
       return;
     }
 
@@ -777,7 +921,8 @@ function App() {
       return false;
     }
 
-    let commandToRun = trimmed.split(/\s+/)[0].toLowerCase();
+    const parts = trimmed.split(/\s+/).filter(Boolean);
+    let commandToRun = (parts[0] ?? "").toLowerCase();
     if (
       commandToRun !== SUPER_DEBUG_COMMAND &&
       commandSuggestions.length > 0 &&
@@ -786,10 +931,15 @@ function App() {
       commandToRun = commandSuggestions[Math.min(commandIndex, commandSuggestions.length - 1)]!.name;
     }
 
+    const commandPayload =
+      commandToRun === (parts[0] ?? "").toLowerCase()
+        ? trimmed
+        : [commandToRun, ...parts.slice(1)].join(" ");
+
     setInput("");
     setInputHistoryIndex(null);
     setInputHistoryDraft("");
-    applyCommand(commandToRun);
+    applyCommand(commandPayload);
     return true;
   };
 
@@ -980,6 +1130,20 @@ function App() {
               }
             }
           })();
+          return;
+        }
+
+        if (selector.kind === "history") {
+          const historyChoice = selector.options[selector.index];
+          if (!historyChoice) {
+            return;
+          }
+          const session = loadChatSession(historyChoice.session.rolloutPath);
+          if (!session) {
+            appendSystemMessage(`failed to load chat: ${historyChoice.session.id}`);
+            return;
+          }
+          resumeSession(session);
           return;
         }
 
@@ -1189,6 +1353,32 @@ function App() {
         setMessages,
         nextMessageId,
       });
+      setActiveSession(null);
+    }
+
+    const normalizedOpenRouterProvider =
+      provider === "openrouter"
+        ? normalizeOpenRouterProviderSelection(selectedOpenRouterProvider)
+        : undefined;
+    const needsNewSession =
+      historyBase.length === 0 || !activeSession || activeSession.provider !== provider;
+    let sessionForTurn = activeSession;
+    if (needsNewSession) {
+      try {
+        sessionForTurn = createChatSession({
+          provider,
+          model: selectedModel,
+          thinkingLevel: selectedThinking,
+          openRouterProvider: normalizedOpenRouterProvider,
+          titleHint: cleanPrompt,
+        });
+        setActiveSession(sessionForTurn);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`history save disabled for this turn: ${message}`);
+        sessionForTurn = null;
+        setActiveSession(null);
+      }
     }
 
     const nextHistory = [...historyBase, { role: "user" as const, text: cleanPrompt }];
@@ -1256,8 +1446,27 @@ function App() {
         role: "assistant",
         text: result.answer,
       };
-      setHistory([...nextHistory, assistantMessage]);
+      const savedHistory = [...nextHistory, assistantMessage];
+      setHistory(savedHistory);
       setConversationProvider(provider);
+
+      if (sessionForTurn) {
+        try {
+          const updatedSession = writeChatSession({
+            session: sessionForTurn,
+            messages: savedHistory,
+            provider,
+            model: selectedModel,
+            thinkingLevel: selectedThinking,
+            openRouterProvider: normalizedOpenRouterProvider,
+            titleHint: cleanPrompt,
+          });
+          setActiveSession(updatedSession);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error);
+          appendSystemMessage(`chat history save failed: ${message}`);
+        }
+      }
 
       setMessages((current) => [
         ...current,
@@ -2107,6 +2316,27 @@ function MessageRow({ message }: { message: UiMessage }) {
   );
 }
 
+function chatHistoryToUiMessages(history: ChatMessage[], nextMessageId: () => number): UiMessage[] {
+  return history.map((message) => ({
+    id: nextMessageId(),
+    kind: message.role,
+    text: message.text,
+  }));
+}
+
+function formatSessionTimestamp(value: string): string {
+  const time = Date.parse(value);
+  if (!Number.isFinite(time)) {
+    return value;
+  }
+  return new Date(time).toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function parseThoughtTitle(rawThought: string): string {
   const text = rawThought.trim();
   if (!text) {
@@ -2631,5 +2861,3 @@ async function startApp(): Promise<void> {
 
   render(<App />);
 }
-
-
