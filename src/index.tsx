@@ -31,6 +31,12 @@ import { runOpenAiInferenceStream } from "./openai.js";
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
 import type { ChatMessage, DebugEvent } from "./chat-types.js";
+import {
+  buildSkillPromptContext,
+  loadSkillsCatalog,
+  mapMessagesForModel,
+  type SkillDefinition,
+} from "./skills/index.js";
 
 type UiMessage = {
   id: number;
@@ -192,9 +198,12 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/forgeteverything", description: "wipe local config and restart onboarding" },
   { name: "/model", description: "choose model and thinking level" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
+  { name: "/skills", description: "list available skills from ~/.loaf/skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
   { name: "/help", description: "show available commands" },
+  { name: "/quit", description: "exit loaf" },
+  { name: "/exit", description: "exit loaf" },
 ];
 
 const SUPER_DEBUG_COMMAND = "/superdebug-69";
@@ -250,7 +259,10 @@ function App() {
   const initialInputHistory = persistedState?.inputHistory ?? [];
   const initialExaApiKey = persistedState?.exaApiKey ?? loafConfig.exaApiKey;
   const initialOnboardingCompleted = resolveInitialOnboardingCompleted(persistedState);
+  const initialSkillCatalog = useMemo(() => loadSkillsCatalog(), []);
   const [input, setInput] = useState("");
+  const [textInputResetKey, setTextInputResetKey] = useState(0);
+  const [autocompletedSkillPrefix, setAutocompletedSkillPrefix] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [statusLabel, setStatusLabel] = useState("ready");
   const [superDebug, setSuperDebug] = useState(false);
@@ -273,6 +285,8 @@ function App() {
   const [conversationProvider, setConversationProvider] = useState<AuthProvider | null>(null);
   const [selector, setSelector] = useState<SelectorState | null>(null);
   const [commandIndex, setCommandIndex] = useState(0);
+  const [skillIndex, setSkillIndex] = useState(0);
+  const [availableSkills, setAvailableSkills] = useState<SkillDefinition[]>(initialSkillCatalog.skills);
   const [history, setHistory] = useState<ChatMessage[]>([]);
   const [activeSession, setActiveSession] = useState<ChatSessionSummary | null>(null);
   const [inputHistory, setInputHistory] = useState<string[]>(initialInputHistory);
@@ -327,6 +341,24 @@ function App() {
     return COMMAND_OPTIONS.filter((command) => command.name.startsWith(query));
   }, [input]);
 
+  const skillSuggestions = useMemo(() => {
+    if (!input.startsWith("$")) {
+      return [] as SkillDefinition[];
+    }
+    const firstToken = input.trim().split(/\s+/)[0] ?? "";
+    const query = firstToken.slice(1).trim().toLowerCase();
+    if (!query) {
+      return availableSkills;
+    }
+    return availableSkills.filter((skill) => skill.nameLower.startsWith(query));
+  }, [input, availableSkills]);
+
+  const suppressSkillSuggestions = Boolean(
+    autocompletedSkillPrefix && input.startsWith(autocompletedSkillPrefix),
+  );
+  const showSkillSuggestions =
+    input.startsWith("$") && skillSuggestions.length > 0 && !suppressSkillSuggestions;
+
   useEffect(() => {
     setCommandIndex((current) => {
       if (commandSuggestions.length === 0) {
@@ -335,6 +367,29 @@ function App() {
       return Math.min(current, commandSuggestions.length - 1);
     });
   }, [commandSuggestions.length]);
+
+  useEffect(() => {
+    setSkillIndex((current) => {
+      if (skillSuggestions.length === 0) {
+        return 0;
+      }
+      return Math.min(current, skillSuggestions.length - 1);
+    });
+  }, [skillSuggestions.length]);
+
+  useEffect(() => {
+    if (!input.startsWith("$")) {
+      return;
+    }
+    const catalog = loadSkillsCatalog();
+    setAvailableSkills(catalog.skills);
+  }, [input]);
+
+  useEffect(() => {
+    if (autocompletedSkillPrefix && !input.startsWith(autocompletedSkillPrefix)) {
+      setAutocompletedSkillPrefix(null);
+    }
+  }, [input, autocompletedSkillPrefix]);
 
   useEffect(() => {
     configureBuiltinTools({
@@ -438,6 +493,12 @@ function App() {
         text,
       },
     ]);
+  };
+
+  const refreshSkillsCatalog = () => {
+    const catalog = loadSkillsCatalog();
+    setAvailableSkills(catalog.skills);
+    return catalog;
   };
 
   const appendDebugEvent = (event: DebugEvent) => {
@@ -1015,6 +1076,19 @@ function App() {
       return;
     }
 
+    if (command === "/skills") {
+      const catalog = refreshSkillsCatalog();
+      if (catalog.skills.length === 0) {
+        appendSystemMessage(`no skills found in ${catalog.directory}`);
+        return;
+      }
+      const lines = catalog.skills
+        .map((skill) => `${skill.name} - ${skill.descriptionPreview}`)
+        .join("\n");
+      appendSystemMessage(`available skills (${catalog.skills.length}):\n${lines}`);
+      return;
+    }
+
     if (command === "/tools") {
       const lines = defaultToolRegistry
         .list()
@@ -1027,6 +1101,11 @@ function App() {
     if (command === "/help") {
       const commandLines = COMMAND_OPTIONS.map((option) => `${option.name} - ${option.description}`).join("\n");
       appendSystemMessage(`available commands:\n${commandLines}`);
+      return;
+    }
+
+    if (command === "/quit" || command === "/exit") {
+      exit();
       return;
     }
 
@@ -1104,6 +1183,13 @@ function App() {
     setInputHistoryIndex(null);
     setInput(inputHistoryDraft);
     return true;
+  };
+
+  const applySkillAutocomplete = (rawInput: string, suggestionName: string) => {
+    setInput(replaceLeadingSkillTokenWithSuggestion(rawInput, suggestionName));
+    setAutocompletedSkillPrefix(`$${suggestionName} `);
+    // Remount controlled TextInput so cursor jumps to the end after autocomplete.
+    setTextInputResetKey((current) => current + 1);
   };
 
   useInput((character, key) => {
@@ -1444,6 +1530,33 @@ function App() {
       }
     }
 
+    if (showSkillSuggestions) {
+      if (key.upArrow || key.downArrow) {
+        const direction = key.downArrow ? 1 : -1;
+        setSkillIndex((current) => {
+          const optionCount = skillSuggestions.length;
+          return (current + direction + optionCount) % optionCount;
+        });
+        return;
+      }
+
+      if (key.return) {
+        const suggestion = skillSuggestions[skillIndex];
+        if (suggestion && shouldAutocompleteSkillInputOnEnter(input, suggestion.nameLower)) {
+          applySkillAutocomplete(input, suggestion.name);
+          return;
+        }
+      }
+
+      if (key.tab) {
+        const suggestion = skillSuggestions[skillIndex];
+        if (suggestion) {
+          applySkillAutocomplete(input, suggestion.name);
+        }
+        return;
+      }
+    }
+
     if (!input.startsWith("/") && (key.upArrow || key.downArrow)) {
       const usedHistory = navigateInputHistory(key.upArrow ? "up" : "down");
       if (usedHistory) {
@@ -1485,6 +1598,13 @@ function App() {
       appendSystemMessage("openrouter model selected, but no openrouter api key is available. run /auth.");
       openAuthSelector(false);
       return;
+    }
+    const skillCatalog = refreshSkillsCatalog();
+    const skillPromptContext = buildSkillPromptContext(cleanPrompt, skillCatalog.skills);
+    if (skillPromptContext.selection.combined.length > 0) {
+      appendSystemMessage(
+        `skills applied: ${skillPromptContext.selection.combined.map((skill) => skill.name).join(", ")}`,
+      );
     }
 
     setInput("");
@@ -1540,6 +1660,10 @@ function App() {
     }
 
     const nextHistory = [...historyBase, { role: "user" as const, text: cleanPrompt }];
+    const modelHistory: ChatMessage[] = [
+      ...mapMessagesForModel(historyBase, skillCatalog.skills),
+      { role: "user", text: skillPromptContext.modelPrompt },
+    ];
     const nextUserMessage: UiMessage = {
       id: nextMessageId(),
       kind: "user",
@@ -1586,6 +1710,7 @@ function App() {
       const runtimeSystemInstruction = buildRuntimeSystemInstruction({
         baseInstruction: loafConfig.systemInstruction,
         hasExaSearch: Boolean(exaApiKey.trim()),
+        skillInstructionBlock: skillPromptContext.instructionBlock,
       });
 
       const result =
@@ -1594,7 +1719,7 @@ function App() {
               {
                 apiKey: openRouterApiKey,
                 model: selectedModel,
-                messages: nextHistory,
+                messages: modelHistory,
                 thinkingLevel: selectedThinking,
                 includeThoughts: selectedThinking !== "OFF",
                 forcedProvider:
@@ -1613,7 +1738,7 @@ function App() {
                 accessToken: openAiAccessToken,
                 chatgptAccountId: openAiAccountId,
                 model: selectedModel,
-                messages: nextHistory,
+                messages: modelHistory,
                 thinkingLevel: selectedThinking,
                 includeThoughts: selectedThinking !== "OFF",
                 systemInstruction: runtimeSystemInstruction,
@@ -1807,9 +1932,20 @@ function App() {
           <Text color="gray">tab autocomplete | up/down navigate suggestions</Text>
         </Box>
       )}
+      {showSkillSuggestions && !selector && (
+        <Box flexDirection="column" marginTop={1}>
+          {skillSuggestions.map((skill, index) => (
+            <Text key={skill.name} color={index === skillIndex ? "magentaBright" : "gray"}>
+              {index === skillIndex ? ">" : " "} ${skill.name} - {skill.descriptionPreview}
+            </Text>
+          ))}
+          <Text color="gray">enter/tab autocomplete | up/down navigate skills</Text>
+        </Box>
+      )}
       <Box marginTop={1}>
         <Text color="magentaBright">{selector ? "select> " : GLYPH_USER}</Text>
         <TextInput
+          key={`prompt-input-${textInputResetKey}`}
           value={input}
           onChange={(value) => {
             if (
@@ -1841,6 +1977,14 @@ function App() {
               return;
             }
 
+            if (showSkillSuggestions && submitted.startsWith("$")) {
+              const suggestion = skillSuggestions[skillIndex];
+              if (suggestion && shouldAutocompleteSkillInputOnEnter(submitted, suggestion.nameLower)) {
+                applySkillAutocomplete(submitted, suggestion.name);
+                return;
+              }
+            }
+
             const trimmed = submitted.trim();
             if (!trimmed) {
               return;
@@ -1853,6 +1997,12 @@ function App() {
             if (pending) {
               if (!activeInferenceAbortControllerRef.current) {
                 appendSystemMessage("busy. wait for current operation to finish.");
+                return;
+              }
+
+              const pendingCommand = trimmed.split(/\s+/)[0]?.toLowerCase();
+              if (pendingCommand === "/quit" || pendingCommand === "/exit") {
+                exit();
                 return;
               }
 
@@ -1908,6 +2058,39 @@ function parseSteerCommand(rawInput: string): string | null {
   }
   const payload = trimmed.slice("/steer".length).trim();
   return payload || null;
+}
+
+function replaceLeadingSkillTokenWithSuggestion(rawInput: string, suggestionName: string): string {
+  const trimmed = rawInput.trimStart();
+  const firstSpaceIndex = trimmed.indexOf(" ");
+  if (firstSpaceIndex < 0) {
+    return `$${suggestionName} `;
+  }
+  const remainder = trimmed.slice(firstSpaceIndex).trim();
+  if (!remainder) {
+    return `$${suggestionName} `;
+  }
+  return `$${suggestionName} ${remainder}`;
+}
+
+function shouldAutocompleteSkillInputOnEnter(rawInput: string, selectedSkillNameLower: string): boolean {
+  const trimmed = rawInput.trimStart();
+  if (!trimmed.startsWith("$")) {
+    return false;
+  }
+
+  const firstSpaceIndex = trimmed.indexOf(" ");
+  const firstToken = firstSpaceIndex < 0 ? trimmed : trimmed.slice(0, firstSpaceIndex);
+  const enteredSkillName = firstToken.slice(1).trim().toLowerCase();
+  const trailingContent = firstSpaceIndex < 0 ? "" : trimmed.slice(firstSpaceIndex + 1).trim();
+  const hasTrailingPromptText = trailingContent.length > 0;
+  const isExactSkillMatch = enteredSkillName === selectedSkillNameLower;
+
+  if (isExactSkillMatch && hasTrailingPromptText) {
+    return false;
+  }
+
+  return true;
 }
 
 function isAbortError(error: unknown): boolean {
@@ -2828,17 +3011,21 @@ function normalizeInlineMarkdown(input: string): string {
 function buildRuntimeSystemInstruction(params: {
   baseInstruction: string;
   hasExaSearch: boolean;
+  skillInstructionBlock?: string;
 }): string {
   const base = params.baseInstruction.trim();
-  if (!params.hasExaSearch) {
-    return base;
+  const sections = [base];
+
+  if (params.hasExaSearch && !base.toLowerCase().includes("search_web")) {
+    sections.push(SEARCH_WEB_PROMPT_EXTENSION);
   }
 
-  if (base.toLowerCase().includes("search_web")) {
-    return base;
+  const skillInstructionBlock = params.skillInstructionBlock?.trim() ?? "";
+  if (skillInstructionBlock) {
+    sections.push(skillInstructionBlock);
   }
 
-  return `${base}\n${SEARCH_WEB_PROMPT_EXTENSION}`.trim();
+  return sections.filter(Boolean).join("\n\n").trim();
 }
 
 void startApp();
