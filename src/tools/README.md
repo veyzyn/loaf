@@ -7,7 +7,7 @@ this folder contains the tool system used by `loaf`.
 - `types.ts`: shared tool contracts (`ToolDefinition`, `ToolCall`, `ToolResult`)
 - `registry.ts`: registration + lookup (`ToolRegistry`)
 - `runtime.ts`: execution wrapper (`ToolRuntime`)
-- `builtin/javascript.ts`: js-first tools (`run_js`, `install_js_packages`, `run_js_module`)
+- `builtin/javascript.ts`: js-first tools (`run_js`, `install_js_packages`, `run_js_module`, background session tools)
 - `builtin/persistent-tool.ts`: built-in tool for writing+autoloading persistent tools
 - `custom.ts`: loader for user-provided js tools
 - `index.ts`: default registry/runtime exports + custom tool bootstrap

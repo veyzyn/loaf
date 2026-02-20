@@ -194,6 +194,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
+  { name: "/quit", description: "exit loaf" },
   { name: "/help", description: "show available commands" },
 ];
 
@@ -281,6 +282,9 @@ function App() {
   const nextIdRef = useRef(1);
   const activeInferenceAbortControllerRef = useRef<AbortController | null>(null);
   const steeringQueueRef = useRef<ChatMessage[]>([]);
+  const queuedPromptsRef = useRef<string[]>([]);
+  const [queuedPromptsVersion, setQueuedPromptsVersion] = useState(0);
+  const suppressNextSubmitRef = useRef(false);
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
@@ -455,6 +459,20 @@ function App() {
     });
     setInput("");
     setStatusLabel("steer queued...");
+    return true;
+  };
+
+  const queuePendingPrompt = (rawText: string): boolean => {
+    const text = rawText.trim();
+    if (!text) {
+      return false;
+    }
+    queuedPromptsRef.current.push(text);
+    setQueuedPromptsVersion((current) => current + 1);
+    setInput("");
+    appendSystemMessage(
+      `queued message (${queuedPromptsRef.current.length}): ${clipInline(text, 80)}`,
+    );
     return true;
   };
 
@@ -1004,6 +1022,11 @@ function App() {
       return;
     }
 
+    if (command === "/quit") {
+      exit();
+      return;
+    }
+
     if (command === SUPER_DEBUG_COMMAND) {
       const next = !superDebug;
       setSuperDebug(next);
@@ -1083,6 +1106,20 @@ function App() {
   useInput((character, key) => {
     if (key.ctrl && character === "c") {
       exit();
+      return;
+    }
+
+    if (!selector && pending && key.return && key.shift) {
+      const trimmed = input.trim();
+      if (!trimmed) {
+        appendSystemMessage("enter a steer message first, then press shift+enter.");
+        suppressNextSubmitRef.current = true;
+        return;
+      }
+
+      const steerText = parseSteerCommand(trimmed) ?? trimmed;
+      queueSteeringMessage(steerText);
+      suppressNextSubmitRef.current = true;
       return;
     }
 
@@ -1713,6 +1750,18 @@ function App() {
     }
   };
 
+  useEffect(() => {
+    if (pending) {
+      return;
+    }
+    const nextQueuedPrompt = queuedPromptsRef.current.shift();
+    if (!nextQueuedPrompt) {
+      return;
+    }
+    setQueuedPromptsVersion((current) => current + 1);
+    void sendPrompt(nextQueuedPrompt);
+  }, [pending, queuedPromptsVersion]);
+
   return (
     <Box flexDirection="column" paddingX={1}>
       <Text color="cyanBright">loaf | beta</Text>
@@ -1821,6 +1870,11 @@ function App() {
             }
           }}
           onSubmit={(submitted) => {
+            if (suppressNextSubmitRef.current) {
+              suppressNextSubmitRef.current = false;
+              return;
+            }
+
             if (selector && selector.kind !== "openrouter_api_key" && selector.kind !== "exa_api_key") {
               return;
             }
@@ -1835,24 +1889,13 @@ function App() {
             }
 
             if (pending) {
-              if (!activeInferenceAbortControllerRef.current) {
-                appendSystemMessage("busy. wait for current operation to finish.");
-                return;
-              }
-
               if (trimmed.startsWith("/")) {
-                const steerText = parseSteerCommand(trimmed);
-                if (!steerText) {
-                  appendSystemMessage(
-                    "while running, send plain text (or /steer <message>) to steer, or press esc to interrupt.",
-                  );
-                  return;
-                }
-                queueSteeringMessage(steerText);
+                appendSystemMessage(
+                  "slash commands cannot be queued while running. use esc to interrupt first.",
+                );
                 return;
               }
-
-              queueSteeringMessage(trimmed);
+              queuePendingPrompt(trimmed);
               return;
             }
 
@@ -1878,7 +1921,7 @@ function App() {
         />
       </Box>
       <Text color="gray">
-        {pending ? "esc interrupt | enter to steer | " : ""}
+        {pending ? "esc interrupt | enter queue | shift+enter steer | " : ""}
         {exitShortcutLabel} exit | /help for commands
       </Text>
     </Box>
@@ -1950,6 +1993,11 @@ function shouldCollapseSuccessDetail(name: string): boolean {
     name !== "install_js_packages" &&
     name !== "run_js" &&
     name !== "run_js_module" &&
+    name !== "start_background_js" &&
+    name !== "read_background_js" &&
+    name !== "write_background_js" &&
+    name !== "stop_background_js" &&
+    name !== "list_background_js" &&
     name !== "search_web"
   );
 }
@@ -1992,6 +2040,26 @@ function formatToolSummary(name: string, input: unknown, result: unknown): strin
     return "searched web";
   }
 
+  if (name === "start_background_js") {
+    return "started background javascript session";
+  }
+
+  if (name === "read_background_js") {
+    return "read background javascript output";
+  }
+
+  if (name === "write_background_js") {
+    return "sent input to background javascript session";
+  }
+
+  if (name === "stop_background_js") {
+    return "stopped background javascript session";
+  }
+
+  if (name === "list_background_js") {
+    return "listed background javascript sessions";
+  }
+
   if (name === "create_persistent_tool") {
     return "created persistent tool";
   }
@@ -2030,6 +2098,56 @@ function formatToolDetail(name: string, input: unknown, result: unknown): string
 
   if (name === "search_web") {
     return formatWithStatus(formatSearchWebDetail(payload, record));
+  }
+
+  if (name === "start_background_js") {
+    const sessionId = readTrimmedString(record.session_id);
+    const sessionName = readTrimmedString(record.session_name);
+    if (sessionId && sessionName) {
+      return formatWithStatus(`${sessionName} (${sessionId})`);
+    }
+    if (sessionId) {
+      return formatWithStatus(sessionId);
+    }
+  }
+
+  if (name === "read_background_js") {
+    const stdout = readTrimmedString(record.stdout);
+    const stderr = readTrimmedString(record.stderr);
+    const combined = stdout || stderr;
+    if (combined) {
+      const firstLine = combined
+        .replace(/\r\n/g, "\n")
+        .split("\n")
+        .map((line) => line.trim())
+        .find(Boolean);
+      if (firstLine) {
+        return formatWithStatus(clipInline(firstLine, 180));
+      }
+    }
+    const running = record.running === true ? "running" : "idle";
+    return formatWithStatus(running);
+  }
+
+  if (name === "write_background_js") {
+    const bytes = typeof record.bytes_written === "number" ? record.bytes_written : null;
+    if (typeof bytes === "number") {
+      return formatWithStatus(`${bytes} byte(s) written`);
+    }
+  }
+
+  if (name === "stop_background_js") {
+    const signal = readTrimmedString(record.signal);
+    if (signal) {
+      return formatWithStatus(`stop requested (${signal})`);
+    }
+  }
+
+  if (name === "list_background_js") {
+    const count = typeof record.count === "number" ? record.count : null;
+    if (typeof count === "number") {
+      return formatWithStatus(`${count} session(s)`);
+    }
   }
 
   if (name === "create_persistent_tool") {

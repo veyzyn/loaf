@@ -22,6 +22,8 @@ a terminal-first ai assistant cli built with ink + react.
   - `run_js`
   - `install_js_packages`
   - `run_js_module`
+  - `start_background_js` / `read_background_js` / `write_background_js` / `stop_background_js` / `list_background_js`
+    - `start_background_js` supports `session_name` + `reuse_session` (default true) to avoid duplicate interactive sessions
   - `create_persistent_tool` (creates + autoloads custom js tools)
 - optional web search tool via exa (`search_web`) with highlights
 - custom js tool loading from user folders
@@ -65,6 +67,7 @@ loaf persists data in a single home directory:
 - `models-cache.json` provider model cache
 - `sessions/YYYY/MM/DD/rollout-*.jsonl` saved chat sessions (used by `/history`)
 - `js-runtime/` transient js scripts created by `run_js`
+- `js-runtime/background/` transient js scripts created by `start_background_js`
 - `tools/` user-provided js tools (auto-loaded)
 
 ## notes
@@ -73,3 +76,4 @@ loaf persists data in a single home directory:
 - tools live in `src/tools/`.
 - custom tools are discovered only from `<loaf data dir>/tools`.
 - detailed custom tool docs: `CUSTOM_TOOLS.md`
+- while the agent is running, use `enter` to queue a follow-up message, `shift+enter` to steer, or `esc` to interrupt.

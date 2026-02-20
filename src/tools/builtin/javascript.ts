@@ -31,6 +31,39 @@ type RunJsModuleInput = ToolInput & {
   package_manager?: JsonValue;
 };
 
+type StartBackgroundJsInput = ToolInput & {
+  code?: JsonValue;
+  args?: JsonValue;
+  cwd?: JsonValue;
+  keep_script?: JsonValue;
+  runtime?: JsonValue;
+  format?: JsonValue;
+  session_name?: JsonValue;
+  reuse_session?: JsonValue;
+};
+
+type ReadBackgroundJsInput = ToolInput & {
+  session_id?: JsonValue;
+  max_chars?: JsonValue;
+  stream?: JsonValue;
+  peek?: JsonValue;
+};
+
+type WriteBackgroundJsInput = ToolInput & {
+  session_id?: JsonValue;
+  input?: JsonValue;
+  append_newline?: JsonValue;
+};
+
+type StopBackgroundJsInput = ToolInput & {
+  session_id?: JsonValue;
+  force?: JsonValue;
+};
+
+type ListBackgroundJsInput = ToolInput & {
+  include_exited?: JsonValue;
+};
+
 type ProcessRunResult = {
   command: string;
   args: string[];
@@ -48,12 +81,47 @@ type ProcessRunResult = {
 type PackageManager = "bun" | "pnpm" | "yarn" | "npm";
 type ScriptRuntime = "bun" | "node";
 type ScriptFormat = "module" | "commonjs";
+type BackgroundStreamSelector = "both" | "stdout" | "stderr";
+
+type BackgroundStreamState = {
+  buffer: string;
+  totalChars: number;
+  droppedChars: number;
+  readCursor: number;
+};
+
+type BackgroundSessionStatus = "running" | "exited";
+
+type BackgroundSession = {
+  id: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+  cwd: string;
+  runtime: ScriptRuntime;
+  command: string;
+  args: string[];
+  pid: number | null;
+  scriptPath: string;
+  keepScript: boolean;
+  status: BackgroundSessionStatus;
+  exitCode: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: BackgroundStreamState;
+  stderr: BackgroundStreamState;
+  child: ReturnType<typeof spawn>;
+};
 
 const MAX_CAPTURE_CHARS = 300_000;
+const MAX_BACKGROUND_CAPTURE_CHARS = 300_000;
+const DEFAULT_BACKGROUND_READ_CHARS = 8_000;
+const MAX_BACKGROUND_READ_CHARS = 120_000;
 const DEFAULT_TIMEOUT_SECONDS = 120;
 const MAX_TIMEOUT_SECONDS = 60 * 20;
 const COMMAND_DETECTION_TIMEOUT_MS = 8_000;
 const commandAvailabilityCache = new Map<string, Promise<boolean>>();
+const backgroundSessions = new Map<string, BackgroundSession>();
+let backgroundCleanupInstalled = false;
 
 const runJsTool: ToolDefinition<RunJsInput> = {
   name: "run_js",
@@ -289,10 +357,430 @@ const runJsModuleTool: ToolDefinition<RunJsModuleInput> = {
   },
 };
 
+const startBackgroundJsTool: ToolDefinition<StartBackgroundJsInput> = {
+  name: "start_background_js",
+  description:
+    "start a javascript script in the background and return a session id that can be read/written later.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      code: {
+        type: "string",
+        description: "full javascript code to execute in the background.",
+      },
+      args: {
+        type: "array",
+        description: "optional argv passed to the script.",
+        items: { type: "string" },
+      },
+      cwd: {
+        type: "string",
+        description: "optional working directory for script execution.",
+      },
+      keep_script: {
+        type: "boolean",
+        description: "keep generated script file on disk after process exit. default false.",
+      },
+      runtime: {
+        type: "string",
+        description: "runtime: auto, node, or bun. default auto.",
+      },
+      format: {
+        type: "string",
+        description: "script format: module or commonjs. default module.",
+      },
+      session_name: {
+        type: "string",
+        description: "optional friendly label for this background session.",
+      },
+      reuse_session: {
+        type: "boolean",
+        description: "when true, reuse an existing running session with the same session_name and cwd. default true.",
+      },
+    },
+    required: ["code"],
+    additionalProperties: false,
+  },
+  run: async (input) => {
+    const code = asNonEmptyString(input.code);
+    if (!code) {
+      return invalidInput("start_background_js requires a non-empty `code` string.");
+    }
+
+    const args = parseStringArray(input.args);
+    const cwd = asNonEmptyString(input.cwd) || process.cwd();
+    const keepScript = asBoolean(input.keep_script);
+    const requestedRuntime = normalizeScriptRuntime(input.runtime);
+    const format = normalizeScriptFormat(input.format);
+    const sessionNameRaw = asNonEmptyString(input.session_name);
+    const sessionName = sessionNameRaw || "background-js";
+    const reuseSession = input.reuse_session === undefined ? true : asBoolean(input.reuse_session);
+
+    if (reuseSession && sessionNameRaw) {
+      const existing = findRunningBackgroundSession(sessionNameRaw, cwd);
+      if (existing) {
+        return {
+          ok: true,
+          output: {
+            status: "reused",
+            session_id: existing.id,
+            session_name: existing.name,
+            pid: existing.pid,
+            runtime: existing.runtime,
+            command: existing.command,
+            args: existing.args,
+            cwd: existing.cwd,
+            created_at: existing.createdAt,
+          },
+        };
+      }
+    }
+
+    const runtime = await resolveScriptRuntime(requestedRuntime);
+    if (!runtime) {
+      const requestedLabel = requestedRuntime === "auto" ? "auto" : requestedRuntime;
+      return invalidInput(`start_background_js could not resolve runtime "${requestedLabel}".`);
+    }
+
+    const runDir = path.join(getLoafDataDir(), "js-runtime", "background");
+    await fs.mkdir(runDir, { recursive: true });
+    const scriptPath = path.join(runDir, createScriptFileName(format));
+    await fs.writeFile(scriptPath, code, "utf8");
+    ensureBackgroundCleanupHook();
+
+    const command = runtime.command;
+    const commandArgs = [...runtime.baseArgs, scriptPath, ...args];
+    const child = spawn(command, commandArgs, {
+      cwd,
+      env: process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
+    });
+
+    const sessionId = createBackgroundSessionId();
+    const now = new Date().toISOString();
+    const session: BackgroundSession = {
+      id: sessionId,
+      name: sessionName,
+      createdAt: now,
+      updatedAt: now,
+      cwd,
+      runtime: runtime.name,
+      command,
+      args: commandArgs,
+      pid: child.pid ?? null,
+      scriptPath,
+      keepScript,
+      status: "running",
+      exitCode: null,
+      signal: null,
+      stdout: createBackgroundStreamState(),
+      stderr: createBackgroundStreamState(),
+      child,
+    };
+    backgroundSessions.set(sessionId, session);
+
+    child.stdout?.on("data", (chunk) => {
+      appendToBackgroundStream(session.stdout, String(chunk));
+      session.updatedAt = new Date().toISOString();
+    });
+    child.stderr?.on("data", (chunk) => {
+      appendToBackgroundStream(session.stderr, String(chunk));
+      session.updatedAt = new Date().toISOString();
+    });
+    child.on("error", (error) => {
+      appendToBackgroundStream(session.stderr, `[spawn error] ${error.message}\n`);
+      session.updatedAt = new Date().toISOString();
+    });
+    child.on("close", (exitCode, signal) => {
+      session.status = "exited";
+      session.exitCode = exitCode;
+      session.signal = signal;
+      session.updatedAt = new Date().toISOString();
+      if (!session.keepScript) {
+        void fs.unlink(session.scriptPath).catch(() => {
+          // best effort cleanup
+        });
+      }
+    });
+
+    return {
+      ok: true,
+      output: {
+        status: "started",
+        session_id: session.id,
+        session_name: session.name,
+        pid: session.pid,
+        runtime: session.runtime,
+        command: session.command,
+        args: session.args,
+        cwd: session.cwd,
+        created_at: session.createdAt,
+      },
+    };
+  },
+};
+
+const readBackgroundJsTool: ToolDefinition<ReadBackgroundJsInput> = {
+  name: "read_background_js",
+  description:
+    "read buffered stdout/stderr from a running or exited background js session.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: {
+        type: "string",
+        description: "session id returned by start_background_js.",
+      },
+      max_chars: {
+        type: "number",
+        description: "max characters per stream to return (default 8000, max 120000).",
+      },
+      stream: {
+        type: "string",
+        description: "stream selector: both, stdout, or stderr. default both.",
+      },
+      peek: {
+        type: "boolean",
+        description: "when true, do not advance the internal read cursor.",
+      },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+  },
+  run: (input) => {
+    const session = getBackgroundSession(input.session_id);
+    if (!session) {
+      return invalidInput("read_background_js requires a valid `session_id`.");
+    }
+
+    const maxChars = parseBackgroundReadChars(input.max_chars);
+    const stream = normalizeBackgroundStreamSelector(input.stream);
+    const peek = asBoolean(input.peek);
+    if (!stream) {
+      return invalidInput("`stream` must be one of: both, stdout, stderr.");
+    }
+
+    const stdoutRead = stream === "both" || stream === "stdout"
+      ? readBackgroundStream(session.stdout, maxChars, peek)
+      : createEmptyBackgroundRead(session.stdout.readCursor);
+    const stderrRead = stream === "both" || stream === "stderr"
+      ? readBackgroundStream(session.stderr, maxChars, peek)
+      : createEmptyBackgroundRead(session.stderr.readCursor);
+
+    return {
+      ok: true,
+      output: {
+        status: "ok",
+        session_id: session.id,
+        session_name: session.name,
+        running: session.status === "running",
+        exit_code: session.exitCode,
+        signal: session.signal ?? null,
+        stdout: stdoutRead.text,
+        stderr: stderrRead.text,
+        stdout_cursor: stdoutRead.cursor,
+        stderr_cursor: stderrRead.cursor,
+        stdout_has_more: stdoutRead.hasMore,
+        stderr_has_more: stderrRead.hasMore,
+        stdout_dropped: stdoutRead.dropped,
+        stderr_dropped: stderrRead.dropped,
+      },
+    };
+  },
+};
+
+const writeBackgroundJsTool: ToolDefinition<WriteBackgroundJsInput> = {
+  name: "write_background_js",
+  description:
+    "write input text to stdin of a running background js session.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: {
+        type: "string",
+        description: "session id returned by start_background_js.",
+      },
+      input: {
+        type: "string",
+        description: "text to write to stdin.",
+      },
+      append_newline: {
+        type: "boolean",
+        description: "append newline to input before writing. default true.",
+      },
+    },
+    required: ["session_id", "input"],
+    additionalProperties: false,
+  },
+  run: async (input) => {
+    const session = getBackgroundSession(input.session_id);
+    if (!session) {
+      return invalidInput("write_background_js requires a valid `session_id`.");
+    }
+    if (session.status !== "running") {
+      return {
+        ok: false,
+        output: {
+          status: "not_running",
+          session_id: session.id,
+          running: false,
+          exit_code: session.exitCode,
+          signal: session.signal ?? null,
+          bytes_written: null,
+        },
+        error: "background session is not running",
+      };
+    }
+
+    if (typeof input.input !== "string") {
+      return invalidInput("write_background_js requires `input` as a string.");
+    }
+
+    const appendNewline = input.append_newline === undefined ? true : asBoolean(input.append_newline);
+    const finalPayload = appendNewline ? `${input.input}\n` : input.input;
+
+    if (!session.child.stdin || session.child.stdin.destroyed) {
+      return {
+        ok: false,
+        output: {
+          status: "stdin_unavailable",
+          session_id: session.id,
+          running: session.status === "running",
+          exit_code: session.exitCode,
+          signal: session.signal ?? null,
+          bytes_written: null,
+        },
+        error: "background session stdin is unavailable",
+      };
+    }
+
+    await writeToBackgroundStdin(session.child.stdin, finalPayload);
+    session.updatedAt = new Date().toISOString();
+
+    return {
+      ok: true,
+      output: {
+        status: "ok",
+        session_id: session.id,
+        running: session.status === "running",
+        exit_code: session.exitCode,
+        signal: session.signal ?? null,
+        bytes_written: Buffer.byteLength(finalPayload),
+      },
+    };
+  },
+};
+
+const stopBackgroundJsTool: ToolDefinition<StopBackgroundJsInput> = {
+  name: "stop_background_js",
+  description:
+    "stop a background js session.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      session_id: {
+        type: "string",
+        description: "session id returned by start_background_js.",
+      },
+      force: {
+        type: "boolean",
+        description: "when true, send SIGKILL. default false (SIGTERM).",
+      },
+    },
+    required: ["session_id"],
+    additionalProperties: false,
+  },
+  run: async (input) => {
+    const session = getBackgroundSession(input.session_id);
+    if (!session) {
+      return invalidInput("stop_background_js requires a valid `session_id`.");
+    }
+
+    if (session.status !== "running") {
+      return {
+        ok: true,
+        output: {
+          status: "already_stopped",
+          session_id: session.id,
+          running: false,
+          exit_code: session.exitCode,
+          signal: session.signal ?? null,
+        },
+      };
+    }
+
+    const force = asBoolean(input.force);
+    const signal: NodeJS.Signals = force ? "SIGKILL" : "SIGTERM";
+    session.child.kill(signal);
+    await sleepMs(force ? 50 : 120);
+
+    return {
+      ok: true,
+      output: {
+        status: "stop_requested",
+        session_id: session.id,
+        signal,
+        running: session.status === "running",
+        exit_code: session.exitCode,
+      },
+    };
+  },
+};
+
+const listBackgroundJsTool: ToolDefinition<ListBackgroundJsInput> = {
+  name: "list_background_js",
+  description:
+    "list known background js sessions and their state.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      include_exited: {
+        type: "boolean",
+        description: "include exited sessions. default false.",
+      },
+    },
+    additionalProperties: false,
+  },
+  run: (input) => {
+    const includeExited = asBoolean(input.include_exited);
+    const sessions = Array.from(backgroundSessions.values())
+      .filter((session) => includeExited || session.status === "running")
+      .sort((left, right) => right.createdAt.localeCompare(left.createdAt))
+      .map((session) => ({
+        session_id: session.id,
+        session_name: session.name,
+        pid: session.pid,
+        status: session.status,
+        running: session.status === "running",
+        exit_code: session.exitCode,
+        signal: session.signal ?? null,
+        created_at: session.createdAt,
+        updated_at: session.updatedAt,
+        unread_stdout_chars: unreadBackgroundChars(session.stdout),
+        unread_stderr_chars: unreadBackgroundChars(session.stderr),
+      }));
+
+    return {
+      ok: true,
+      output: {
+        status: "ok",
+        count: sessions.length,
+        sessions,
+      },
+    };
+  },
+};
+
 export const JAVASCRIPT_BUILTIN_TOOLS: ToolDefinition[] = [
   runJsTool,
   installJsPackagesTool,
   runJsModuleTool,
+  startBackgroundJsTool,
+  readBackgroundJsTool,
+  writeBackgroundJsTool,
+  stopBackgroundJsTool,
+  listBackgroundJsTool,
 ];
 
 function normalizeScriptRuntime(value: JsonValue | undefined): "auto" | ScriptRuntime {
@@ -487,6 +975,162 @@ function createScriptFileName(format: ScriptFormat): string {
   const suffix = Math.random().toString(16).slice(2, 10);
   const extension = format === "commonjs" ? "cjs" : "mjs";
   return `run-${Date.now()}-${suffix}.${extension}`;
+}
+
+function createBackgroundSessionId(): string {
+  const suffix = Math.random().toString(16).slice(2, 10);
+  return `bg-${Date.now()}-${suffix}`;
+}
+
+function findRunningBackgroundSession(name: string, cwd: string): BackgroundSession | null {
+  for (const session of backgroundSessions.values()) {
+    if (session.status !== "running") {
+      continue;
+    }
+    if (session.name === name && session.cwd === cwd) {
+      return session;
+    }
+  }
+  return null;
+}
+
+function ensureBackgroundCleanupHook(): void {
+  if (backgroundCleanupInstalled) {
+    return;
+  }
+  backgroundCleanupInstalled = true;
+  process.on("exit", () => {
+    for (const session of backgroundSessions.values()) {
+      if (session.status !== "running") {
+        continue;
+      }
+      try {
+        session.child.kill("SIGTERM");
+      } catch {
+        // best effort cleanup
+      }
+    }
+  });
+}
+
+function createBackgroundStreamState(): BackgroundStreamState {
+  return {
+    buffer: "",
+    totalChars: 0,
+    droppedChars: 0,
+    readCursor: 0,
+  };
+}
+
+function appendToBackgroundStream(stream: BackgroundStreamState, chunk: string): void {
+  if (!chunk) {
+    return;
+  }
+  stream.totalChars += chunk.length;
+  stream.buffer = `${stream.buffer}${chunk}`;
+  if (stream.buffer.length > MAX_BACKGROUND_CAPTURE_CHARS) {
+    const dropCount = stream.buffer.length - MAX_BACKGROUND_CAPTURE_CHARS;
+    stream.buffer = stream.buffer.slice(dropCount);
+    stream.droppedChars += dropCount;
+  }
+}
+
+function normalizeBackgroundStreamSelector(value: JsonValue | undefined): BackgroundStreamSelector | null {
+  if (value === undefined) {
+    return "both";
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "both" || normalized === "stdout" || normalized === "stderr") {
+    return normalized;
+  }
+  return null;
+}
+
+function parseBackgroundReadChars(value: JsonValue | undefined): number {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) {
+    return DEFAULT_BACKGROUND_READ_CHARS;
+  }
+  return Math.max(1, Math.min(MAX_BACKGROUND_READ_CHARS, Math.floor(value)));
+}
+
+function getBackgroundSession(value: JsonValue | undefined): BackgroundSession | null {
+  const sessionId = asNonEmptyString(value);
+  if (!sessionId) {
+    return null;
+  }
+  return backgroundSessions.get(sessionId) ?? null;
+}
+
+function unreadBackgroundChars(stream: BackgroundStreamState): number {
+  const cursor = Math.max(stream.readCursor, stream.droppedChars);
+  return Math.max(0, stream.totalChars - cursor);
+}
+
+function createEmptyBackgroundRead(cursor: number): {
+  text: string;
+  cursor: number;
+  hasMore: boolean;
+  dropped: boolean;
+} {
+  return {
+    text: "",
+    cursor,
+    hasMore: false,
+    dropped: false,
+  };
+}
+
+function readBackgroundStream(
+  stream: BackgroundStreamState,
+  maxChars: number,
+  peek: boolean,
+): {
+  text: string;
+  cursor: number;
+  hasMore: boolean;
+  dropped: boolean;
+} {
+  const dropped = stream.readCursor < stream.droppedChars;
+  const startCursor = Math.max(stream.readCursor, stream.droppedChars);
+  const availableChars = Math.max(0, stream.totalChars - startCursor);
+  const readChars = Math.min(maxChars, availableChars);
+  const startIndex = startCursor - stream.droppedChars;
+  const text = readChars > 0 ? stream.buffer.slice(startIndex, startIndex + readChars) : "";
+  const nextCursor = startCursor + text.length;
+  const hasMore = stream.totalChars > nextCursor;
+
+  if (!peek) {
+    stream.readCursor = nextCursor;
+  }
+
+  return {
+    text,
+    cursor: nextCursor,
+    hasMore,
+    dropped,
+  };
+}
+
+async function writeToBackgroundStdin(stdin: NodeJS.WritableStream, payload: string): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    stdin.write(payload, (error) => {
+      if (error) {
+        reject(error);
+        return;
+      }
+      resolve();
+    });
+  });
+}
+
+function sleepMs(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, ms));
+  });
 }
 
 function processOutputToJson(
