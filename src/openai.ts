@@ -14,7 +14,7 @@ export type OpenAIRequest = {
 };
 
 const CHATGPT_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex";
-const OPENAI_MODELS_CLIENT_VERSION = "0.1.0";
+const OPENAI_MODELS_CLIENT_VERSION = "0.99.0";
 const OPENAI_MODELS_ORIGINATOR = "codex_cli_rs";
 const MAX_429_RETRY_ATTEMPTS = 8;
 const RETRY_BASE_DELAY_MS = 1_250;
@@ -67,7 +67,7 @@ export function createChatgptCodexClient(
   }
 
   const defaultHeaders: Record<string, string> = {
-    version: "0.1.0",
+    version: OPENAI_MODELS_CLIENT_VERSION,
     originator: OPENAI_MODELS_ORIGINATOR,
   };
   const accountId = chatgptAccountId?.trim();
