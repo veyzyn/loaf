@@ -159,6 +159,20 @@ export async function runAntigravityInferenceStream(
     const parts = extractResponseParts(response);
     const functionCalls = extractFunctionCalls(parts, toolRound);
     if (functionCalls.length > 0) {
+      const parsedPreTool = extractInferenceTextFromParts(parts);
+      const preToolThoughts = request.includeThoughts ? parsedPreTool.thoughts : [];
+      const preToolSegments = request.includeThoughts
+        ? parsedPreTool.segments
+        : parsedPreTool.segments.filter((segment) => segment.kind === "answer");
+      const preToolAnswer = parsedPreTool.answer.trim();
+      if (preToolThoughts.length > 0 || preToolAnswer || preToolSegments.length > 0) {
+        onChunk?.({
+          thoughts: preToolThoughts,
+          answerText: preToolAnswer,
+          segments: preToolSegments,
+        });
+      }
+
       onDebug?.({
         stage: "tool_calls",
         data: {
@@ -191,6 +205,19 @@ export async function runAntigravityInferenceStream(
         const runtimeToolName =
           toolDeclarations.providerToRuntimeName.get(call.providerToolName) ?? call.providerToolName;
 
+        onDebug?.({
+          stage: "tool_call_started",
+          data: {
+            toolRound,
+            call: {
+              name: runtimeToolName,
+              input: call.args,
+              providerToolName: call.providerToolName,
+              callId: call.callId,
+            },
+          },
+        });
+
         const toolResult = await defaultToolRuntime.execute(
           {
             id: call.callId,
@@ -209,6 +236,19 @@ export async function runAntigravityInferenceStream(
           input: call.args,
           result: toolResult.output,
           error: toolResult.error,
+        });
+        onDebug?.({
+          stage: "tool_call_completed",
+          data: {
+            toolRound,
+            executed: {
+              name: runtimeToolName,
+              ok: toolResult.ok,
+              input: call.args,
+              result: toolResult.output,
+              error: toolResult.error,
+            },
+          },
         });
 
         const responsePayload = toolResult.ok

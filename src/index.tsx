@@ -52,6 +52,7 @@ import { fetchOpenAiUsageSnapshot, runOpenAiInferenceStream, type OpenAiUsageSna
 import { listOpenRouterProvidersForModel, runOpenRouterInferenceStream } from "./openrouter.js";
 import { configureBuiltinTools, defaultToolRegistry, loadCustomTools } from "./tools/index.js";
 import type { ChatImageAttachment, ChatMessage, DebugEvent, StreamChunk } from "./chat-types.js";
+import { buildToolReplacement, consumeAssistantBoundary, parseToolCallPreview } from "./interleaving.js";
 import {
   buildSkillPromptContext,
   loadSkillsCatalog,
@@ -556,11 +557,14 @@ function App() {
   }, [exaApiKey]);
 
   useEffect(() => {
+    if (!secretsHydrated) {
+      return;
+    }
     void persistRuntimeSecrets({
       openRouterApiKey,
       exaApiKey,
     });
-  }, [openRouterApiKey, exaApiKey]);
+  }, [openRouterApiKey, exaApiKey, secretsHydrated]);
 
   useEffect(() => {
     savePersistedState({
@@ -725,17 +729,6 @@ function App() {
     appendSystemMessage(
       `[debug] ${event.stage}\n${payload}`,
     );
-  };
-
-  const appendToolEvents = (event: DebugEvent) => {
-    if (event.stage !== "tool_results") {
-      return;
-    }
-
-    const rows = formatToolRows(event.data);
-    for (const row of rows) {
-      appendSystemMessage(row);
-    }
   };
 
   const queueSteeringMessage = (rawText: string): boolean => {
@@ -2238,6 +2231,29 @@ function App() {
 
     let assistantDraftText = "";
     const appliedSteeringMessages: ChatMessage[] = [];
+    let emittedAssistantChars = 0;
+    const pendingToolMessageIds: number[] = [];
+    let hasIncrementalToolLifecycleEvents = false;
+
+    const emitAssistantSinceBoundary = (fullText: string) => {
+      const next = consumeAssistantBoundary({
+        fullText,
+        emittedChars: emittedAssistantChars,
+      });
+      const delta = next.delta;
+      emittedAssistantChars = next.emittedChars;
+      if (!delta.trim()) {
+        return;
+      }
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId(),
+          kind: "assistant",
+          text: delta,
+        },
+      ]);
+    };
 
     const appendAssistantDraftDelta = (deltaText: string) => {
       if (!deltaText) {
@@ -2272,6 +2288,9 @@ function App() {
           let thoughtIndex = 0;
           for (const segment of segments) {
             if (segment.kind === "thought") {
+              // Codex-style interleaving boundary: when reasoning resumes after
+              // assistant output, finalize the current assistant segment first.
+              emitAssistantSinceBoundary(assistantDraftText);
               const thoughtText =
                 chunk.thoughts[thoughtIndex] ??
                 chunk.thoughts[chunk.thoughts.length - 1] ??
@@ -2290,6 +2309,11 @@ function App() {
           return;
         }
 
+        if (chunk.thoughts.length > 0) {
+          // Fallback for providers that only populate `thoughts` without
+          // explicit segment metadata.
+          emitAssistantSinceBoundary(assistantDraftText);
+        }
         for (const rawThought of chunk.thoughts) {
           const title = parseThoughtTitle(rawThought);
           setStatusLabel(`thinking: ${title}`);
@@ -2302,7 +2326,145 @@ function App() {
       };
 
       const handleDebug = (event: DebugEvent) => {
-        appendToolEvents(event);
+        if (event.stage === "tool_call_started") {
+          hasIncrementalToolLifecycleEvents = true;
+          emitAssistantSinceBoundary(assistantDraftText);
+          const row = formatToolStartRow(event.data);
+          if (row) {
+            const messageId = nextMessageId();
+            pendingToolMessageIds.push(messageId);
+            setMessages((current) => [
+              ...current,
+              {
+                id: messageId,
+                kind: "system",
+                text: row,
+              },
+            ]);
+          }
+        }
+
+        if (event.stage === "tool_call_completed") {
+          hasIncrementalToolLifecycleEvents = true;
+          emitAssistantSinceBoundary(assistantDraftText);
+          const row = formatToolCompletedRow(event.data);
+          if (row) {
+            const pendingId = pendingToolMessageIds.shift();
+            if (typeof pendingId === "number") {
+              setMessages((current) =>
+                current.map((message) =>
+                  message.id === pendingId
+                    ? {
+                        ...message,
+                        text: row,
+                      }
+                    : message,
+                ),
+              );
+            } else {
+              setMessages((current) => [
+                ...current,
+                {
+                  id: nextMessageId(),
+                  kind: "system",
+                  text: row,
+                },
+              ]);
+            }
+          }
+        }
+
+        if (event.stage === "tool_calls") {
+          if (hasIncrementalToolLifecycleEvents) {
+            appendDebugEvent(event);
+            return;
+          }
+          // Incremental tool lifecycle (`tool_call_started` / `tool_call_completed`)
+          // is now the primary rendering path. Keep this branch as a
+          // compatibility no-op so we don't duplicate rows when both events fire.
+          emitAssistantSinceBoundary(assistantDraftText);
+          appendDebugEvent(event);
+          return;
+        }
+
+        if (event.stage === "tool_results") {
+          const toolRows = formatToolRows(event.data);
+          if (hasIncrementalToolLifecycleEvents) {
+            if (pendingToolMessageIds.length > 0 && toolRows.length > 0) {
+              const replacementPlan = buildToolReplacement({
+                pendingIds: pendingToolMessageIds,
+                toolRows,
+              });
+              const replacementMap = new Map<number, string>(
+                replacementPlan.replacements.map((item) => [item.id, item.row]),
+              );
+              if (replacementMap.size > 0) {
+                setMessages((current) =>
+                  current.map((message) => {
+                    const replacement = replacementMap.get(message.id);
+                    if (!replacement) {
+                      return message;
+                    }
+                    return {
+                      ...message,
+                      text: replacement,
+                    };
+                  }),
+                );
+              }
+              pendingToolMessageIds.splice(0, replacementPlan.consumed);
+            }
+            appendDebugEvent(event);
+            return;
+          }
+
+          emitAssistantSinceBoundary(assistantDraftText);
+          if (toolRows.length > 0) {
+            if (pendingToolMessageIds.length > 0) {
+              const replacementPlan = buildToolReplacement({
+                pendingIds: pendingToolMessageIds,
+                toolRows,
+              });
+              const replacementMap = new Map<number, string>(
+                replacementPlan.replacements.map((item) => [item.id, item.row]),
+              );
+              const extraRows = replacementPlan.extraRows;
+              setMessages((current) => {
+                const updated = current.map((message) => {
+                  const replacement = replacementMap.get(message.id);
+                  if (!replacement) {
+                    return message;
+                  }
+                  return {
+                    ...message,
+                    text: replacement,
+                  };
+                });
+                if (extraRows.length === 0) {
+                  return updated;
+                }
+                return [
+                  ...updated,
+                  ...extraRows.map((row) => ({
+                    id: nextMessageId(),
+                    kind: "system" as const,
+                    text: row,
+                    })),
+                ];
+              });
+              pendingToolMessageIds.splice(0, replacementPlan.consumed);
+            } else {
+              setMessages((current) => [
+                ...current,
+                ...toolRows.map((row) => ({
+                  id: nextMessageId(),
+                  kind: "system" as const,
+                  text: row,
+                })),
+              ]);
+            }
+          }
+        }
         appendDebugEvent(event);
       };
       const runtimeSystemInstruction = buildRuntimeSystemInstruction({
@@ -2362,10 +2524,12 @@ function App() {
               handleDebug,
             );
 
-      assistantDraftText = result.answer;
+      const finalAssistantText = assistantDraftText || result.answer;
+      assistantDraftText = finalAssistantText;
+      emitAssistantSinceBoundary(finalAssistantText);
       const assistantMessage: ChatMessage = {
         role: "assistant",
-        text: result.answer,
+        text: finalAssistantText,
       };
       const savedHistory = [...nextHistory, ...appliedSteeringMessages, assistantMessage];
       setHistory(savedHistory);
@@ -2389,14 +2553,16 @@ function App() {
         }
       }
 
-      setMessages((current) => [
-        ...current,
-        {
-          id: nextMessageId(),
-          kind: "assistant",
-          text: result.answer,
-        },
-      ]);
+      if (!finalAssistantText.trim() && emittedAssistantChars === 0) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: nextMessageId(),
+            kind: "assistant",
+            text: "(No response text returned)",
+          },
+        ]);
+      }
 
     } catch (error) {
       if (isAbortError(error)) {
@@ -2426,7 +2592,8 @@ function App() {
           }
         }
 
-        if (interruptedAssistant) {
+        emitAssistantSinceBoundary(interruptedAssistant);
+        if (interruptedAssistant && emittedAssistantChars === 0) {
           setMessages((current) => [
             ...current,
             {
@@ -2446,6 +2613,7 @@ function App() {
       }
 
       const message = error instanceof Error ? error.message : String(error);
+      emitAssistantSinceBoundary(assistantDraftText);
       setMessages((current) => [
         ...current,
         {
@@ -2816,6 +2984,37 @@ function formatToolRows(data: unknown): string[] {
   }
 
   return rows;
+}
+
+function formatToolStartRows(data: unknown): string[] {
+  const functionCalls = (data as { functionCalls?: unknown })?.functionCalls;
+  if (!Array.isArray(functionCalls)) {
+    return [];
+  }
+
+  const rows: string[] = [];
+  for (const rawCall of functionCalls) {
+    const row = formatToolStartRow(rawCall);
+    if (row) {
+      rows.push(row);
+    }
+  }
+  return rows;
+}
+
+function formatToolStartRow(rawCall: unknown): string | null {
+  const parsed = parseToolCallPreview(rawCall);
+  if (!parsed) {
+    return null;
+  }
+  const summary = formatToolSummary(parsed.name, parsed.input, {});
+  return `${summary} (starting...)`;
+}
+
+function formatToolCompletedRow(data: unknown): string | null {
+  const executed = (data as { executed?: unknown })?.executed;
+  const row = formatToolRows({ executed: [executed] })[0];
+  return typeof row === "string" && row.trim() ? row : null;
 }
 
 function shouldCollapseSuccessDetail(name: string): boolean {

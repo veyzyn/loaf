@@ -51,24 +51,7 @@ const OPENAI_REASONING_CODEX_MINI: ThinkingLevel[] = ["MEDIUM", "HIGH"];
 const OPENROUTER_REASONING_ENABLED: ThinkingLevel[] = ["OFF", "MINIMAL", "LOW", "MEDIUM", "HIGH"];
 const OPENROUTER_REASONING_DISABLED: ThinkingLevel[] = ["OFF"];
 
-const DEFAULT_OPENAI_MODEL_OPTIONS: ModelOption[] = [
-  {
-    id: "gpt-4.1",
-    provider: "openai",
-    label: "gpt 4.1",
-    description: "stronger reasoning and coding quality",
-    supportedThinkingLevels: OPENAI_REASONING_GENERAL,
-    defaultThinkingLevel: "MEDIUM",
-  },
-  {
-    id: "gpt-4.1-mini",
-    provider: "openai",
-    label: "gpt 4.1 mini",
-    description: "faster responses with lower latency",
-    supportedThinkingLevels: OPENAI_REASONING_GENERAL,
-    defaultThinkingLevel: "MEDIUM",
-  },
-];
+const DEFAULT_OPENAI_MODEL_OPTIONS: ModelOption[] = [];
 
 const DEFAULT_OPENROUTER_MODEL_OPTIONS: ModelOption[] = [];
 

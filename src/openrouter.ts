@@ -217,6 +217,15 @@ export async function runOpenRouterInferenceStream(
 
     const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
     if (toolCalls.length > 0) {
+      const preToolAnswer = normalizeContentString(message.content).trim();
+      if (preToolAnswer) {
+        onChunk?.({
+          thoughts: [],
+          answerText: preToolAnswer,
+          segments: [{ kind: "answer", text: preToolAnswer }],
+        });
+      }
+
       onDebug?.({
         stage: "tool_calls",
         data: {
@@ -251,6 +260,19 @@ export async function runOpenRouterInferenceStream(
         const argumentsRaw = readTrimmedString(functionRecord.arguments) || "{}";
         const callArgs = safeParseObject(argumentsRaw);
 
+        onDebug?.({
+          stage: "tool_call_started",
+          data: {
+            toolRound,
+            call: {
+              name: runtimeToolName,
+              input: callArgs,
+              providerToolName,
+              callId,
+            },
+          },
+        });
+
         const toolResult = await defaultToolRuntime.execute(
           {
             id: callId,
@@ -269,6 +291,19 @@ export async function runOpenRouterInferenceStream(
           input: callArgs,
           result: toolResult.output,
           error: toolResult.error,
+        });
+        onDebug?.({
+          stage: "tool_call_completed",
+          data: {
+            toolRound,
+            executed: {
+              name: runtimeToolName,
+              ok: toolResult.ok,
+              input: callArgs,
+              result: toolResult.output,
+              error: toolResult.error,
+            },
+          },
         });
 
         const responsePayload = toolResult.ok

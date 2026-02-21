@@ -212,12 +212,21 @@ export async function runOpenAiInferenceStream(
       },
     });
 
+    let streamedAnswerTextThisRound = "";
+    const handleChunkThisRound = (chunk: StreamChunk) => {
+      const answerDelta = extractAnswerDeltaFromChunk(chunk);
+      if (answerDelta) {
+        streamedAnswerTextThisRound += answerDelta;
+      }
+      onChunk?.(chunk);
+    };
+
     const response = await createResponseWithRetry(
       client,
       requestPayload,
       toolRound,
       onDebug,
-      onChunk,
+      handleChunkThisRound,
       request.signal,
     );
 
@@ -229,8 +238,18 @@ export async function runOpenAiInferenceStream(
       },
     });
 
-    const functionCalls = (response.output ?? []).filter((item) => item?.type === "function_call");
+    const functionCalls = selectActionableFunctionCalls(response.output);
     if (functionCalls.length > 0) {
+      const preToolAnswer = extractResponseText(response).trim();
+      const missingPreToolDelta = computeUnstreamedAnswerDelta(preToolAnswer, streamedAnswerTextThisRound);
+      if (missingPreToolDelta) {
+        onChunk?.({
+          thoughts: [],
+          answerText: missingPreToolDelta,
+          segments: [{ kind: "answer", text: missingPreToolDelta }],
+        });
+      }
+
       onDebug?.({
         stage: "tool_calls",
         data: {
@@ -269,6 +288,19 @@ export async function runOpenAiInferenceStream(
         const callArgumentsRaw = typeof call.arguments === "string" && call.arguments.trim() ? call.arguments : "{}";
         const callArgs = safeParseObject(callArgumentsRaw);
 
+        onDebug?.({
+          stage: "tool_call_started",
+          data: {
+            toolRound,
+            call: {
+              name: runtimeToolName,
+              input: callArgs,
+              providerToolName,
+              callId,
+            },
+          },
+        });
+
         const toolResult = await defaultToolRuntime.execute(
           {
             id: callId,
@@ -287,6 +319,19 @@ export async function runOpenAiInferenceStream(
           input: callArgs,
           result: toolResult.output,
           error: toolResult.error,
+        });
+        onDebug?.({
+          stage: "tool_call_completed",
+          data: {
+            toolRound,
+            executed: {
+              name: runtimeToolName,
+              ok: toolResult.ok,
+              input: callArgs,
+              result: toolResult.output,
+              error: toolResult.error,
+            },
+          },
         });
 
         const responsePayload = toolResult.ok
@@ -342,11 +387,12 @@ export async function runOpenAiInferenceStream(
     }
     const finalAnswer = answer || "(No response text returned)";
 
-    if (onChunk) {
+    const missingFinalAnswerDelta = computeUnstreamedAnswerDelta(finalAnswer, streamedAnswerTextThisRound);
+    if (onChunk && missingFinalAnswerDelta) {
       onChunk({
         thoughts: [],
-        answerText: finalAnswer,
-        segments: [{ kind: "answer", text: finalAnswer }],
+        answerText: missingFinalAnswerDelta,
+        segments: [{ kind: "answer", text: missingFinalAnswerDelta }],
       });
     }
 
@@ -532,7 +578,8 @@ function extractResponseText(response: {
     type?: string;
     content?: Array<{
       type?: string;
-      text?: string;
+      text?: string | { value?: string };
+      value?: string;
     }>;
   }>;
 }): string {
@@ -548,16 +595,89 @@ function extractResponseText(response: {
     }
 
     for (const contentItem of item.content) {
-      if (contentItem?.type !== "output_text") {
+      const contentType = typeof contentItem?.type === "string" ? contentItem.type : "";
+      if (contentType !== "output_text" && contentType !== "text") {
         continue;
       }
-      if (typeof contentItem.text === "string" && contentItem.text.trim()) {
-        parts.push(contentItem.text.trim());
+      const textField = contentItem.text;
+      const directText = typeof textField === "string" ? textField : "";
+      const nestedValue =
+        textField && typeof textField === "object" && typeof textField.value === "string"
+          ? textField.value
+          : "";
+      const valueField = typeof contentItem.value === "string" ? contentItem.value : "";
+      const text = directText || nestedValue || valueField;
+      if (text.trim()) {
+        parts.push(text.trim());
       }
     }
   }
 
   return parts.join("\n\n").trim();
+}
+
+function extractAnswerDeltaFromChunk(chunk: StreamChunk): string {
+  const segments = Array.isArray(chunk.segments) ? chunk.segments : [];
+  if (segments.length > 0) {
+    const pieces = segments
+      .filter((segment) => segment.kind === "answer" && Boolean(segment.text))
+      .map((segment) => segment.text);
+    if (pieces.length > 0) {
+      return pieces.join("");
+    }
+  }
+  return chunk.answerText || "";
+}
+
+function computeUnstreamedAnswerDelta(expectedText: string, streamedText: string): string {
+  if (!expectedText) {
+    return "";
+  }
+  if (!streamedText) {
+    return expectedText;
+  }
+  if (expectedText === streamedText) {
+    return "";
+  }
+  if (expectedText.startsWith(streamedText)) {
+    return expectedText.slice(streamedText.length);
+  }
+  if (streamedText.includes(expectedText)) {
+    return "";
+  }
+  return "";
+}
+
+function selectActionableFunctionCalls(
+  output: OpenAiResponse["output"] | undefined,
+): Array<NonNullable<OpenAiResponse["output"]>[number]> {
+  const calls = (output ?? []).filter((item) => item?.type === "function_call");
+  if (calls.length === 0) {
+    return [];
+  }
+
+  const seenSignatures = new Set<string>();
+  const uniqueCalls: Array<NonNullable<OpenAiResponse["output"]>[number]> = [];
+  for (const call of calls) {
+    const status = typeof call.status === "string" ? call.status.trim().toLowerCase() : "";
+    if (status && status !== "completed") {
+      continue;
+    }
+
+    const callId = typeof call.call_id === "string" ? call.call_id.trim() : "";
+    const name = typeof call.name === "string" ? call.name.trim() : "";
+    const args = typeof call.arguments === "string" ? call.arguments.trim() : "";
+    const signature = callId || `${name}:${args}`;
+    if (signature && seenSignatures.has(signature)) {
+      continue;
+    }
+    if (signature) {
+      seenSignatures.add(signature);
+    }
+    uniqueCalls.push(call);
+  }
+
+  return uniqueCalls;
 }
 
 async function createResponseWithRetry(
@@ -1038,3 +1158,10 @@ function summarizeHttpError(text: string): string {
   }
   return `${trimmed.slice(0, 177)}...`;
 }
+
+export const __openAiInternals = {
+  computeUnstreamedAnswerDelta,
+  extractAnswerDeltaFromChunk,
+  extractResponseText,
+  selectActionableFunctionCalls,
+};
