@@ -43,6 +43,16 @@ On first launch, `loaf` runs onboarding so you can configure providers and (opti
 | `/quit` | Exit `loaf`. |
 | `/exit` | Exit `loaf`. |
 
+## RPC Mode
+
+Start loaf as a JSON-RPC 2.0 stdio server:
+
+```bash
+npm run rpc
+```
+
+Protocol and method/event docs are in `docs/rpc.md`.
+
 ## Skills and Tools
 
 - Use `/skills` to list discovered skills and mention `$skill-name` to apply one.
