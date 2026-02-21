@@ -99,14 +99,6 @@ export function createChatgptCodexClient(
   });
 }
 
-export async function listOpenAiModelIds(
-  accessToken: string,
-  chatgptAccountId: string | null,
-): Promise<string[]> {
-  const models = await listOpenAiCatalogModels(accessToken, chatgptAccountId);
-  return models.map((model) => model.id);
-}
-
 export async function listOpenAiCatalogModels(
   accessToken: string,
   chatgptAccountId: string | null,

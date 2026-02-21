@@ -6,7 +6,7 @@ export {
   getSkillsDirectory,
   loadSkillsCatalog,
 } from "./loader.js";
-export { parseExplicitSkillMentions, selectSkillsForPrompt } from "./matcher.js";
+export { parseExplicitSkillMentions } from "./matcher.js";
 export {
   buildSkillInstructionBlock,
   buildSkillPromptContext,

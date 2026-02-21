@@ -70,14 +70,13 @@ export type AntigravityModelsDiscoveryResult = {
   source: "remote";
 };
 
-export type AntigravityUsageModelQuota = {
+type AntigravityUsageModelQuota = {
   name: string;
   remainingPercent: number;
   resetTime: string | null;
 };
 
 export type AntigravityUsageSnapshot = {
-  projectId: string;
   models: AntigravityUsageModelQuota[];
 };
 
@@ -144,7 +143,6 @@ export async function fetchAntigravityUsageSnapshot(request: {
   });
 
   return {
-    projectId: project,
     models: normalizeAntigravityUsageModels(fetchResponse),
   };
 }
