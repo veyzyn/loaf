@@ -3666,7 +3666,7 @@ function buildAuthOptions(params: {
     options.splice(1, 0, {
       id: "antigravity",
       label: params.hasAntigravity ? "antigravity oauth (connected)" : "antigravity oauth",
-      description: "real antigravity oauth flow (google cloud scopes)",
+      description: "antigravity oauth flow (google cloud scopes)",
     });
   }
 
