@@ -113,70 +113,70 @@ type OnboardingOption = {
 
 type SelectorState =
   | {
-      kind: "onboarding";
-      title: string;
-      index: number;
-      options: OnboardingOption[];
-    }
+    kind: "onboarding";
+    title: string;
+    index: number;
+    options: OnboardingOption[];
+  }
   | {
-      kind: "auth";
-      title: string;
-      index: number;
-      options: AuthOption[];
-      returnToOnboarding?: boolean;
-    }
+    kind: "auth";
+    title: string;
+    index: number;
+    options: AuthOption[];
+    returnToOnboarding?: boolean;
+  }
   | {
-      kind: "openrouter_api_key";
-      title: string;
-      returnToOnboarding?: boolean;
-    }
+    kind: "openrouter_api_key";
+    title: string;
+    returnToOnboarding?: boolean;
+  }
   | {
-      kind: "exa_api_key";
-      title: string;
-      returnToOnboarding?: boolean;
-    }
+    kind: "exa_api_key";
+    title: string;
+    returnToOnboarding?: boolean;
+  }
   | {
-      kind: "model";
-      title: string;
-      index: number;
-      options: ModelOption[];
-    }
+    kind: "model";
+    title: string;
+    index: number;
+    options: ModelOption[];
+  }
   | {
-      kind: "thinking";
-      title: string;
-      index: number;
-      modelId: string;
-      modelLabel: string;
-      modelProvider: AuthProvider;
-      options: ThinkingOption[];
-    }
+    kind: "thinking";
+    title: string;
+    index: number;
+    modelId: string;
+    modelLabel: string;
+    modelProvider: AuthProvider;
+    options: ThinkingOption[];
+  }
   | {
-      kind: "openrouter_provider";
-      title: string;
-      index: number;
-      modelId: string;
-      modelLabel: string;
-      modelProvider: AuthProvider;
-      thinkingLevel: ThinkingLevel;
-      options: OpenRouterProviderOption[];
-    }
+    kind: "openrouter_provider";
+    title: string;
+    index: number;
+    modelId: string;
+    modelLabel: string;
+    modelProvider: AuthProvider;
+    thinkingLevel: ThinkingLevel;
+    options: OpenRouterProviderOption[];
+  }
   | {
-      kind: "history";
-      title: string;
-      index: number;
-      options: HistoryOption[];
-    }
+    kind: "history";
+    title: string;
+    index: number;
+    options: HistoryOption[];
+  }
   | {
-      kind: "provider_switch_confirm";
-      title: string;
-      index: number;
-      options: ProviderSwitchConfirmOption[];
-      modelId: string;
-      modelLabel: string;
-      modelProvider: AuthProvider;
-      thinkingLevel: ThinkingLevel;
-      openRouterProvider?: string;
-    };
+    kind: "provider_switch_confirm";
+    title: string;
+    index: number;
+    options: ProviderSwitchConfirmOption[];
+    modelId: string;
+    modelLabel: string;
+    modelProvider: AuthProvider;
+    thinkingLevel: ThinkingLevel;
+    openRouterProvider?: string;
+  };
 
 const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "openrouter"];
 
@@ -1319,25 +1319,25 @@ function App() {
       const [openAiResult, antigravityResult] = await Promise.all([
         openAiToken
           ? fetchOpenAiUsageSnapshot(openAiToken, openAiAccountId)
-              .then((snapshot) => ({
-                ok: true as const,
-                snapshot,
-              }))
-              .catch((error) => ({
-                ok: false as const,
-                message: error instanceof Error ? error.message : String(error),
-              }))
+            .then((snapshot) => ({
+              ok: true as const,
+              snapshot,
+            }))
+            .catch((error) => ({
+              ok: false as const,
+              message: error instanceof Error ? error.message : String(error),
+            }))
           : Promise.resolve(null),
         antigravityAccessToken
           ? fetchAntigravityUsageSnapshot({ accessToken: antigravityAccessToken })
-              .then((snapshot) => ({
-                ok: true as const,
-                snapshot,
-              }))
-              .catch((error) => ({
-                ok: false as const,
-                message: error instanceof Error ? error.message : String(error),
-              }))
+            .then((snapshot) => ({
+              ok: true as const,
+              snapshot,
+            }))
+            .catch((error) => ({
+              ok: false as const,
+              message: error instanceof Error ? error.message : String(error),
+            }))
           : Promise.resolve(null),
       ]);
 
@@ -2358,9 +2358,9 @@ function App() {
                 current.map((message) =>
                   message.id === pendingId
                     ? {
-                        ...message,
-                        text: row,
-                      }
+                      ...message,
+                      text: row,
+                    }
                     : message,
                 ),
               );
@@ -2452,7 +2452,7 @@ function App() {
                     id: nextMessageId(),
                     kind: "system" as const,
                     text: row,
-                    })),
+                  })),
                 ];
               });
               pendingToolMessageIds.splice(0, replacementPlan.consumed);
@@ -2479,21 +2479,21 @@ function App() {
       const result =
         isAntigravityModel
           ? await runAntigravityInferenceStream(
-              {
-                accessToken: antigravityAccessToken,
-                model: selectedModel,
-                messages: modelHistory,
-                thinkingLevel: selectedThinking,
-                includeThoughts: selectedThinking !== "OFF",
-                systemInstruction: runtimeSystemInstruction,
-                signal: inferenceAbortController.signal,
-                drainSteeringMessages,
-              },
-              handleChunk,
-              handleDebug,
-            )
+            {
+              accessToken: antigravityAccessToken,
+              model: selectedModel,
+              messages: modelHistory,
+              thinkingLevel: selectedThinking,
+              includeThoughts: selectedThinking !== "OFF",
+              systemInstruction: runtimeSystemInstruction,
+              signal: inferenceAbortController.signal,
+              drainSteeringMessages,
+            },
+            handleChunk,
+            handleDebug,
+          )
           : provider === "openrouter"
-          ? await runOpenRouterInferenceStream(
+            ? await runOpenRouterInferenceStream(
               {
                 apiKey: openRouterApiKey,
                 model: selectedModel,
@@ -2511,7 +2511,7 @@ function App() {
               handleChunk,
               handleDebug,
             )
-          : await runOpenAiInferenceStream(
+            : await runOpenAiInferenceStream(
               {
                 accessToken: openAiAccessToken,
                 chatgptAccountId: openAiAccountId,
@@ -2675,12 +2675,12 @@ function App() {
         model:{" "}
         {selectedModelProvider
           ? formatModelSummary(
-              selectedModelProvider,
-              selectedModel,
-              selectedThinking,
-              modelOptionsByProvider,
-              selectedOpenRouterProvider,
-            )
+            selectedModelProvider,
+            selectedModel,
+            selectedThinking,
+            modelOptionsByProvider,
+            selectedOpenRouterProvider,
+          )
           : "not selected"}
       </Text>
       <Newline />
@@ -2726,8 +2726,8 @@ function App() {
                 {selector.kind === "onboarding"
                   ? "use up/down + enter to configure."
                   : selector.kind === "model"
-                  ? "type to search | up/down select | enter confirm | esc cancels"
-                  : "use up/down + enter. esc cancels."}
+                    ? "type to search | up/down select | enter confirm | esc cancels"
+                    : "use up/down + enter. esc cancels."}
               </Text>
             </>
           )}
@@ -2880,11 +2880,11 @@ function App() {
               ? "enter openrouter api key..."
               : selector?.kind === "exa_api_key"
                 ? "enter exa api key or type 'skip'..."
-              : selector?.kind === "model"
-                ? "search model..."
-                : selector
-                  ? "use selector above..."
-                  : "type a prompt and press enter..."
+                : selector?.kind === "model"
+                  ? "search model..."
+                  : selector
+                    ? "use selector above..."
+                    : "type a prompt and press enter..."
           }
           showCursor
         />
@@ -3012,7 +3012,7 @@ function formatToolStartRow(rawCall: unknown): string | null {
     return null;
   }
   const summary = formatToolSummary(parsed.name, parsed.input, {});
-  return `${summary} (starting...)`;
+  return `${summary} (running...)`;
 }
 
 function formatToolCompletedRow(data: unknown): string | null {
@@ -4121,7 +4121,7 @@ function resolveInitialEnabledProviders(params: {
 }): AuthProvider[] {
   const fromPersisted = dedupeAuthProviders(
     params.persistedProviders ??
-      (params.legacyProvider ? [params.legacyProvider] : []),
+    (params.legacyProvider ? [params.legacyProvider] : []),
   );
   if (fromPersisted.length > 0) {
     return fromPersisted;
