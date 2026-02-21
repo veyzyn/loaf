@@ -59,6 +59,8 @@ import {
   mapMessagesForModel,
   type SkillDefinition,
 } from "./skills/index.js";
+import { createInProcessRpcClient, type InProcessRpcClient } from "./rpc/inprocess-client.js";
+import type { RuntimeEvent, RuntimeSessionState, RuntimeSnapshot } from "./core/runtime.js";
 
 type UiMessage = {
   id: number;
@@ -178,7 +180,48 @@ type SelectorState =
     openRouterProvider?: string;
   };
 
+type RpcModelListResponse = {
+  providers: AuthProvider[];
+  models: ModelOption[];
+  selected_model: string;
+  selected_thinking: ThinkingLevel;
+  selected_provider: AuthProvider | null;
+  selected_openrouter_provider: string;
+};
+
+type RpcLimitsResponse = {
+  openai:
+    | {
+        ok: true;
+        snapshot: OpenAiUsageSnapshot;
+      }
+    | {
+        ok: false;
+        message: string;
+      }
+    | null;
+  antigravity:
+    | {
+        ok: true;
+        snapshot: AntigravityUsageSnapshot;
+      }
+    | {
+        ok: false;
+        message: string;
+      }
+    | null;
+};
+
+type RpcHistoryListResponse = {
+  total: number;
+  cursor: number;
+  limit: number;
+  sessions: ChatSessionSummary[];
+  next_cursor: number | null;
+};
+
 const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "openrouter"];
+const TUI_RPC_DOGFOOD = true;
 
 const THINKING_OPTION_DETAILS: Record<ThinkingLevel, { label: string; description: string }> = {
   OFF: { label: "off", description: "disable reasoning effort" },
@@ -348,11 +391,104 @@ function App() {
     previousInput: "",
     timeout: null,
   });
+  const rpcClientRef = useRef<InProcessRpcClient | null>(null);
+  const rpcSessionIdRef = useRef("");
+  const rpcEventUnsubscribeRef = useRef<(() => void) | null>(null);
+  const streamingAssistantIdRef = useRef<number | null>(null);
+  const streamingAssistantTextRef = useRef("");
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
     nextIdRef.current += 1;
     return id;
+  };
+
+  const requireRpcClient = (): InProcessRpcClient => {
+    const client = rpcClientRef.current;
+    if (!client) {
+      throw new Error("rpc client is not ready");
+    }
+    return client;
+  };
+
+  const getRpcSessionId = (): string => {
+    const sessionId = rpcSessionIdRef.current.trim();
+    if (!sessionId) {
+      throw new Error("rpc session is not ready");
+    }
+    return sessionId;
+  };
+
+  const callRpc = async <T,>(method: string, params?: unknown): Promise<T> => {
+    const client = requireRpcClient();
+    return client.call<T>(method, params);
+  };
+
+  const toUiMessage = (message: RuntimeSessionState["messages"][number]): UiMessage => ({
+    id: message.id,
+    kind: message.kind,
+    text: message.text,
+    images: message.images,
+  });
+
+  const applyRuntimeSnapshot = (snapshot: RuntimeSnapshot) => {
+    setEnabledProviders(snapshot.auth.enabledProviders);
+    setOpenAiAccessToken(snapshot.auth.hasOpenAiToken ? "__rpc_openai__" : "");
+    setOpenAiAccountId(null);
+    setAntigravityOauthTokenInfo(
+      snapshot.auth.hasAntigravityToken
+        ? {
+            accessToken: "__rpc_antigravity__",
+            refreshToken: "",
+            expiryDateSeconds: Number.MAX_SAFE_INTEGER,
+            tokenType: "bearer",
+          }
+        : null,
+    );
+    setAntigravityOauthProfile(snapshot.auth.antigravityProfile);
+    setOpenRouterApiKey(snapshot.auth.hasOpenRouterKey ? "__rpc_openrouter__" : "");
+    setOnboardingCompleted(snapshot.onboarding.completed);
+    setSelectedModel(snapshot.model.selectedModel);
+    setSelectedThinking(snapshot.model.selectedThinking);
+    setSelectedOpenRouterProvider(snapshot.model.selectedOpenRouterProvider);
+  };
+
+  const applyModelList = (payload: RpcModelListResponse) => {
+    const openai = payload.models.filter((option) => option.provider === "openai");
+    const openrouter = payload.models.filter((option) => option.provider === "openrouter");
+    setModelOptionsByProvider({
+      openai: openai.length > 0 ? openai : getDefaultModelOptionsForProvider("openai"),
+      openrouter: openrouter.length > 0 ? openrouter : getDefaultModelOptionsForProvider("openrouter"),
+    });
+    setAntigravityOpenAiModelOptions(
+      openai.filter((option) => (option.displayProvider ?? "").trim().toLowerCase() === "antigravity"),
+    );
+    setSelectedModel(payload.selected_model);
+    setSelectedThinking(payload.selected_thinking);
+    setSelectedOpenRouterProvider(payload.selected_openrouter_provider);
+  };
+
+  const applyRuntimeSessionState = (state: RuntimeSessionState) => {
+    setPending(state.pending);
+    setStatusLabel(state.statusLabel || (state.pending ? "working..." : "ready"));
+    setMessages(state.messages.map((message) => toUiMessage(message)));
+    setHistory(state.history);
+    setConversationProvider(state.conversationProvider);
+  };
+
+  const refreshRuntimeState = async () => {
+    const snapshot = await callRpc<RuntimeSnapshot>("state.get");
+    applyRuntimeSnapshot(snapshot);
+    const modelList = await callRpc<RpcModelListResponse>("model.list", {});
+    applyModelList(modelList);
+  };
+
+  const refreshRuntimeSessionState = async () => {
+    const sessionId = getRpcSessionId();
+    const state = await callRpc<RuntimeSessionState>("session.get", {
+      session_id: sessionId,
+    });
+    applyRuntimeSessionState(state);
   };
 
   const hasOpenAiToken = openAiAccessToken.trim().length > 0;
@@ -474,72 +610,268 @@ function App() {
   useEffect(() => {
     let cancelled = false;
 
+    const appendRuntimeSystemMessage = (text: string) => {
+      setMessages((current) => [
+        ...current,
+        {
+          id: nextMessageId(),
+          kind: "system",
+          text,
+        },
+      ]);
+    };
+
+    const appendStreamingDelta = (delta: string) => {
+      if (!delta) {
+        return;
+      }
+
+      const existingId = streamingAssistantIdRef.current;
+      if (existingId === null) {
+        const messageId = nextMessageId();
+        streamingAssistantIdRef.current = messageId;
+        streamingAssistantTextRef.current = delta;
+        setMessages((current) => [
+          ...current,
+          {
+            id: messageId,
+            kind: "assistant",
+            text: delta,
+          },
+        ]);
+        return;
+      }
+
+      streamingAssistantTextRef.current += delta;
+      const nextText = streamingAssistantTextRef.current;
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === existingId
+            ? {
+                ...message,
+                text: nextText,
+              }
+            : message,
+        ),
+      );
+    };
+
+    const finalizeStreamingAssistant = (text: string) => {
+      const existingId = streamingAssistantIdRef.current;
+      if (existingId === null) {
+        setMessages((current) => [
+          ...current,
+          {
+            id: nextMessageId(),
+            kind: "assistant",
+            text,
+          },
+        ]);
+        return;
+      }
+
+      setMessages((current) =>
+        current.map((message) =>
+          message.id === existingId
+            ? {
+                ...message,
+                text,
+              }
+            : message,
+        ),
+      );
+      streamingAssistantIdRef.current = null;
+      streamingAssistantTextRef.current = "";
+    };
+
+    const handleRuntimeEvent = (event: RuntimeEvent) => {
+      if (cancelled) {
+        return;
+      }
+
+      const payload = event.payload ?? {};
+      const payloadSessionId = typeof payload.session_id === "string" ? payload.session_id : "";
+      if (payloadSessionId && payloadSessionId !== rpcSessionIdRef.current) {
+        return;
+      }
+
+      if (event.type === "session.status") {
+        const nextPending = payload.pending === true;
+        const label = typeof payload.status_label === "string" ? payload.status_label : nextPending ? "working..." : "ready";
+        setPending(nextPending);
+        setStatusLabel(label);
+        if (!nextPending) {
+          streamingAssistantIdRef.current = null;
+          streamingAssistantTextRef.current = "";
+        }
+        return;
+      }
+
+      if (event.type === "session.stream.chunk") {
+        // Runtime emits final assistant rows via session.message.appended.
+        // Skip chunk-level rendering to avoid duplicate deltas.
+        return;
+      }
+
+      if (event.type === "session.message.appended") {
+        const message = payload.message as RuntimeSessionState["messages"][number] | undefined;
+        if (!message) {
+          return;
+        }
+        if (message.kind === "assistant") {
+          finalizeStreamingAssistant(message.text);
+        } else {
+          setMessages((current) => [...current, toUiMessage(message)]);
+        }
+        const historyRole =
+          message.kind === "user"
+            ? "user"
+            : message.kind === "assistant"
+              ? "assistant"
+              : null;
+        if (historyRole) {
+          setHistory((current) => [
+            ...current,
+            {
+              role: historyRole,
+              text: message.text,
+              images: message.images,
+            },
+          ]);
+        }
+        return;
+      }
+
+      if (event.type === "session.tool.call.started") {
+        const row = formatToolStartRow(payload.data);
+        if (row) {
+          appendRuntimeSystemMessage(row);
+        }
+        return;
+      }
+
+      if (event.type === "session.tool.call.completed") {
+        const row = formatToolCompletedRow(payload.data);
+        if (row) {
+          appendRuntimeSystemMessage(row);
+        }
+        return;
+      }
+
+      if (event.type === "session.tool.results") {
+        const rows = formatToolRows(payload.data);
+        if (rows.length > 0) {
+          setMessages((current) => [
+            ...current,
+            ...rows.map((row) => ({
+              id: nextMessageId(),
+              kind: "system" as const,
+              text: row,
+            })),
+          ]);
+        }
+        return;
+      }
+
+      if (event.type === "auth.flow.url") {
+        const provider = typeof payload.provider === "string" ? payload.provider : "auth";
+        const url = typeof payload.url === "string" ? payload.url : "";
+        if (url) {
+          appendRuntimeSystemMessage(`${provider} auth url: ${url}`);
+        }
+        return;
+      }
+
+      if (event.type === "auth.flow.device_code") {
+        const verificationUrl = typeof payload.verification_url === "string" ? payload.verification_url : "";
+        const userCode = typeof payload.user_code === "string" ? payload.user_code : "";
+        const expiresInSeconds =
+          typeof payload.expires_in_seconds === "number" && Number.isFinite(payload.expires_in_seconds)
+            ? payload.expires_in_seconds
+            : 0;
+        const expiresMinutes = Math.max(1, Math.ceil(expiresInSeconds / 60));
+        if (verificationUrl) {
+          appendRuntimeSystemMessage(`open ${verificationUrl}`);
+        }
+        if (userCode) {
+          appendRuntimeSystemMessage(`enter code: ${userCode} (expires in ~${expiresMinutes} min)`);
+        }
+        return;
+      }
+
+      if (event.type === "auth.flow.completed") {
+        const provider = typeof payload.provider === "string" ? payload.provider : "auth";
+        appendRuntimeSystemMessage(`${provider} auth complete.`);
+        void refreshRuntimeState();
+        return;
+      }
+
+      if (event.type === "auth.flow.failed") {
+        const provider = typeof payload.provider === "string" ? payload.provider : "auth";
+        const message = typeof payload.message === "string" ? payload.message : "unknown error";
+        appendRuntimeSystemMessage(`${provider} auth failed: ${message}`);
+        return;
+      }
+
+      if (event.type === "state.changed") {
+        const snapshot = payload.snapshot as RuntimeSnapshot | undefined;
+        if (snapshot) {
+          applyRuntimeSnapshot(snapshot);
+        } else {
+          void refreshRuntimeState();
+        }
+      }
+    };
+
     void (async () => {
       try {
-        setStartupStatusLabel("loading saved secrets...");
-        const runtimeSecrets = await loadPersistedRuntimeSecrets(persistedState);
+        setStartupStatusLabel("starting rpc runtime...");
+        const rpcClient = await createInProcessRpcClient();
         if (cancelled) {
+          await rpcClient.call("system.shutdown", {
+            reason: "tui_cancelled",
+          });
           return;
         }
 
-        if (runtimeSecrets.openRouterApiKey) {
-          setOpenRouterApiKey(runtimeSecrets.openRouterApiKey);
-          setEnabledProviders((current) => dedupeAuthProviders([...current, "openrouter"]));
-        }
-        if (runtimeSecrets.exaApiKey) {
-          setExaApiKey(runtimeSecrets.exaApiKey);
-        }
+        rpcClientRef.current = rpcClient;
+        await rpcClient.call("rpc.handshake", {
+          client_name: "loaf_tui",
+          client_version: "dev",
+          protocol_version: "1.0.0",
+        });
 
-        setStartupStatusLabel("loading oauth sessions...");
-        const openAiAuth = await loadPersistedOpenAiChatgptAuth();
-        if (!cancelled && openAiAuth?.accessToken.trim()) {
-          setOpenAiAccessToken(openAiAuth.accessToken);
-          setOpenAiAccountId(openAiAuth.accountId ?? null);
-          setEnabledProviders((current) => dedupeAuthProviders([...current, "openai"]));
-        }
+        const created = await rpcClient.call<{
+          session_id: string;
+          state: RuntimeSessionState;
+        }>("session.create", {
+          title: "tui",
+        });
 
-        const antigravityTokenInfo = await loadPersistedAntigravityOauthTokenInfo();
-        if (!cancelled && antigravityTokenInfo) {
-          const accessToken = antigravityTokenInfo.accessToken.trim();
-          if (accessToken) {
-            // Skip first token-triggered sync effect; bootstrap handles startup sync directly.
-            skipNextAntigravitySyncTokenRef.current = accessToken;
-          }
+        rpcSessionIdRef.current = created.session_id;
+        applyRuntimeSessionState(created.state);
 
-          setStartupStatusLabel("restoring antigravity session...");
-          setAntigravityOauthTokenInfo(antigravityTokenInfo);
-          try {
-            const profile = await fetchAntigravityProfileData(antigravityTokenInfo.accessToken);
-            if (!cancelled) {
-              setAntigravityOauthProfile(profile);
-            }
-          } catch {
-            if (!cancelled) {
-              setAntigravityOauthProfile(null);
-            }
-          }
+        const unsubscribe = rpcClient.onEvent(handleRuntimeEvent);
+        rpcEventUnsubscribeRef.current = unsubscribe;
 
-          if (accessToken) {
-            setStartupStatusLabel("syncing antigravity models...");
-            try {
-              const result = await discoverAntigravityModelOptions({
-                accessToken,
-              });
-              if (!cancelled) {
-                setAntigravityOpenAiModelOptions(toAntigravityOpenAiModelOptions(result.models));
-              }
-            } catch (error) {
-              if (!cancelled) {
-                setAntigravityOpenAiModelOptions([]);
-                const message = error instanceof Error ? error.message : String(error);
-                appendAntigravityModelSyncFailureMessages(appendSystemMessage, message);
-              }
-            }
-          }
-        }
-      } finally {
+        await refreshRuntimeState();
+        await refreshRuntimeSessionState();
         if (!cancelled) {
           setStartupStatusLabel("ready");
+          setSecretsHydrated(true);
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (!cancelled) {
+          setMessages((current) => [
+            ...current,
+            {
+              id: nextMessageId(),
+              kind: "system",
+              text: `rpc startup failed: ${message}`,
+            },
+          ]);
+          setStartupStatusLabel("startup failed");
           setSecretsHydrated(true);
         }
       }
@@ -547,16 +879,32 @@ function App() {
 
     return () => {
       cancelled = true;
+      const unsubscribe = rpcEventUnsubscribeRef.current;
+      rpcEventUnsubscribeRef.current = null;
+      unsubscribe?.();
+      const rpcClient = rpcClientRef.current;
+      rpcClientRef.current = null;
+      if (rpcClient) {
+        void rpcClient.call("system.shutdown", {
+          reason: "tui_exit",
+        }).catch(() => undefined);
+      }
     };
-  }, [persistedState]);
+  }, []);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     configureBuiltinTools({
       exaApiKey,
     });
   }, [exaApiKey]);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     if (!secretsHydrated) {
       return;
     }
@@ -567,6 +915,9 @@ function App() {
   }, [openRouterApiKey, exaApiKey, secretsHydrated]);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     savePersistedState({
       authProviders: enabledProviders,
       selectedModel,
@@ -585,6 +936,9 @@ function App() {
   ]);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     let cancelled = false;
 
     if (!antigravityAccessToken) {
@@ -623,6 +977,9 @@ function App() {
   }, [antigravityAccessToken]);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     setModelOptionsByProvider((current) => {
       const previousIds = previousAntigravityModelIdsRef.current;
       const baseOpenAi = current.openai.filter((option) => !previousIds.has(option.id));
@@ -639,6 +996,9 @@ function App() {
   }, [antigravityOpenAiModelOptions]);
 
   useEffect(() => {
+    if (TUI_RPC_DOGFOOD) {
+      return;
+    }
     let cancelled = false;
     void (async () => {
       for (const provider of enabledProviders) {
@@ -739,12 +1099,23 @@ function App() {
     if (!text) {
       return false;
     }
-    steeringQueueRef.current.push({
-      role: "user",
-      text,
-    });
-    setInput("");
-    setStatusLabel("steer queued...");
+    void (async () => {
+      try {
+        const response = await callRpc<{ session_id: string; accepted: boolean }>("session.steer", {
+          session_id: getRpcSessionId(),
+          text,
+        });
+        if (!response.accepted) {
+          appendSystemMessage("steer rejected: no active inference.");
+          return;
+        }
+        setInput("");
+        setStatusLabel("steer queued...");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`steer failed: ${message}`);
+      }
+    })();
     return true;
   };
 
@@ -753,12 +1124,24 @@ function App() {
     if (!text) {
       return false;
     }
-    queuedPromptsRef.current.push(text);
-    setQueuedPromptsVersion((current) => current + 1);
-    setInput("");
-    appendSystemMessage(
-      `queued message (${queuedPromptsRef.current.length}): ${clipInline(text, 80)}`,
-    );
+    void (async () => {
+      try {
+        await callRpc("session.send", {
+          session_id: getRpcSessionId(),
+          text,
+          enqueue: true,
+        });
+        const queue = await callRpc<{ session_id: string; queue: Array<{ id: string }> }>("session.queue.list", {
+          session_id: getRpcSessionId(),
+        });
+        setQueuedPromptsVersion((current) => current + 1);
+        setInput("");
+        appendSystemMessage(`queued message (${queue.queue.length}): ${clipInline(text, 80)}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`queue failed: ${message}`);
+      }
+    })();
     return true;
   };
 
@@ -789,12 +1172,24 @@ function App() {
   };
 
   const interruptActiveInference = (): boolean => {
-    const controller = activeInferenceAbortControllerRef.current;
-    if (!controller || controller.signal.aborted) {
+    if (!pending) {
       return false;
     }
-    setStatusLabel("interrupting...");
-    controller.abort();
+    void (async () => {
+      try {
+        const response = await callRpc<{ interrupted: boolean }>("session.interrupt", {
+          session_id: getRpcSessionId(),
+        });
+        if (response.interrupted) {
+          setStatusLabel("interrupting...");
+          return;
+        }
+        appendSystemMessage("no active inference to interrupt.");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`interrupt failed: ${message}`);
+      }
+    })();
     return true;
   };
 
@@ -878,25 +1273,8 @@ function App() {
         hasAntigravityToken ? "restarting antigravity oauth login..." : "starting antigravity oauth login...",
       );
       try {
-        const loginResult = await runAntigravityOauthLogin();
-        const accessToken = loginResult.tokenInfo.accessToken.trim();
-        setStatusLabel("syncing antigravity models...");
-        if (accessToken) {
-          try {
-            const result = await discoverAntigravityModelOptions({
-              accessToken,
-            });
-            setAntigravityOpenAiModelOptions(toAntigravityOpenAiModelOptions(result.models));
-            skipNextAntigravitySyncTokenRef.current = accessToken;
-          } catch (error) {
-            setAntigravityOpenAiModelOptions([]);
-            skipNextAntigravitySyncTokenRef.current = accessToken;
-            const message = error instanceof Error ? error.message : String(error);
-            appendAntigravityModelSyncFailureMessages(appendSystemMessage, message);
-          }
-        }
-        setAntigravityOauthTokenInfo(loginResult.tokenInfo);
-        setAntigravityOauthProfile(loginResult.profile);
+        await callRpc("auth.connect.antigravity", {});
+        await refreshRuntimeState();
         appendSystemMessage("antigravity oauth login complete.");
         return true;
       } catch (error) {
@@ -922,112 +1300,73 @@ function App() {
         appendSystemMessage("enter your openrouter api key and press enter.");
         return false;
       }
-      setOpenRouterApiKey(key);
 
       try {
-        const result = await discoverOpenRouterModelOptions({
-          apiKey: key,
+        const result = await callRpc<{
+          configured: boolean;
+          model_count: number;
+          source: string;
+        }>("auth.set.openrouter_key", {
+          api_key: key,
         });
-        setModelOptionsByProvider((current) => ({
-          ...current,
-          openrouter: result.models,
-        }));
-        appendSystemMessage(`openrouter models synced: ${result.models.length} (${result.source})`);
+        await refreshRuntimeState();
+        appendSystemMessage(`openrouter models synced: ${result.model_count} (${result.source})`);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
         appendSystemMessage(`openrouter model sync failed: ${message}`);
+        return false;
       }
-
-      if (enabledProviders.includes(provider)) {
-        appendSystemMessage("openrouter auth already enabled (api key updated).");
-        return true;
-      }
+      appendSystemMessage("openrouter auth configured.");
+      return true;
     } else {
-      let accessToken = openAiAccessToken.trim();
-      let accountId = openAiAccountId?.trim() || null;
-      if (enabledProviders.includes(provider) && accessToken) {
-        appendSystemMessage(`${provider} auth already enabled.`);
-        return true;
+      setPending(true);
+      setStatusLabel("starting oauth login...");
+      appendSystemMessage("starting chatgpt account login...");
+      try {
+        await callRpc("auth.connect.openai", {
+          mode: "auto",
+          originator: "tui",
+        });
+        await refreshRuntimeState();
+        appendSystemMessage("chatgpt oauth login complete.");
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`chatgpt oauth login failed: ${message}`);
+        return false;
+      } finally {
+        setPending(false);
+        setStatusLabel("ready");
       }
-      if (!accessToken) {
-        setPending(true);
-        setStatusLabel("starting oauth login...");
-        appendSystemMessage("starting chatgpt account login...");
-        try {
-          const loginResult = await runOpenAiOauthLogin({
-            onDeviceCode: (info) => {
-              const expiresMinutes = Math.max(1, Math.ceil(info.expiresInSeconds / 60));
-              setStatusLabel("waiting for device code confirmation...");
-              appendSystemMessage("headless login detected.");
-              appendSystemMessage(`open ${info.verificationUrl}`);
-              appendSystemMessage(`enter code: ${info.userCode} (expires in ~${expiresMinutes} min)`);
-            },
-          });
-          accessToken = loginResult.chatgptAuth.accessToken;
-          accountId = loginResult.chatgptAuth.accountId;
-          setOpenAiAccessToken(accessToken);
-          setOpenAiAccountId(accountId);
-          appendSystemMessage(
-            loginResult.loginMethod === "device_code"
-              ? "chatgpt oauth login complete (device code flow)."
-              : "chatgpt oauth login complete.",
-          );
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          appendSystemMessage(`chatgpt oauth login failed: ${message}`);
-          return false;
-        } finally {
-          setPending(false);
-          setStatusLabel("ready");
-        }
-      }
+      return true;
     }
-
-    const nextEnabledProviders = dedupeAuthProviders([...enabledProviders, provider]);
-    const nextModel = resolveModelForEnabledProviders(
-      nextEnabledProviders,
-      selectedModel,
-      modelOptionsByProvider,
-    );
-    const nextModelProvider =
-      findProviderForModel(nextModel, getModelOptionsForProviders(nextEnabledProviders, modelOptionsByProvider)) ??
-      null;
-    const nextThinking = normalizeThinkingForModel(
-      nextModel,
-      nextModelProvider,
-      selectedThinking,
-      modelOptionsByProvider,
-    );
-    setEnabledProviders(nextEnabledProviders);
-    setSelectedModel(nextModel);
-    setSelectedThinking(nextThinking);
-    if (provider === "openrouter" && !selectedOpenRouterProvider.trim()) {
-      setSelectedOpenRouterProvider(OPENROUTER_PROVIDER_ANY_ID);
-    }
-    appendSystemMessage(
-      `auth provider added: ${provider}. enabled: ${nextEnabledProviders.join(", ")}`,
-    );
-    return true;
   };
 
-  const applyExaApiKeySelection = (rawValue: string): "saved" | "skipped" | "invalid" => {
+  const applyExaApiKeySelection = async (rawValue: string): Promise<"saved" | "skipped" | "invalid"> => {
     const value = rawValue.trim();
     if (!value) {
       return "invalid";
     }
 
-    if (value.toLowerCase() === "skip") {
-      setExaApiKey("");
-      appendSystemMessage("exa api key skipped. search_web will be unavailable.");
-      return "skipped";
+    try {
+      await callRpc("auth.set.exa_key", {
+        api_key: value,
+      });
+      await refreshRuntimeState();
+      if (value.toLowerCase() === "skip") {
+        appendSystemMessage("exa api key skipped. search_web will be unavailable.");
+        return "skipped";
+      }
+      appendSystemMessage("exa api key saved. search_web is now available.");
+      return "saved";
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(`failed to save exa api key: ${message}`);
+      return "invalid";
     }
-
-    setExaApiKey(value);
-    appendSystemMessage("exa api key saved. search_web is now available.");
-    return "saved";
   };
 
   const openModelSelector = () => {
+    void refreshRuntimeState().catch(() => undefined);
     if (!onboardingCompleted) {
       openOnboardingSelector();
       return;
@@ -1121,14 +1460,14 @@ function App() {
     };
   };
 
-  const applyModelSelection = (params: {
+  const applyModelSelection = async (params: {
     modelId: string;
     modelLabel: string;
     modelProvider: AuthProvider;
     thinkingLevel: ThinkingLevel;
     openRouterProvider?: string;
     bypassProviderSwitchWarning?: boolean;
-  }) => {
+  }): Promise<void> => {
     const providerChanged =
       selectedModelProvider !== null && selectedModelProvider !== params.modelProvider;
     const hasContextToLose = history.length > 0;
@@ -1162,142 +1501,99 @@ function App() {
       return;
     }
 
-    setSelectedModel(params.modelId);
-    setSelectedThinking(params.thinkingLevel);
-
-    if (params.modelProvider === "openrouter") {
-      setSelectedOpenRouterProvider((params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID).trim() || OPENROUTER_PROVIDER_ANY_ID);
-    }
-
-    if (providerChanged) {
-      resetConversationForProviderSwitch({
-        fromProvider: selectedModelProvider,
-        toProvider: params.modelProvider,
-        setHistory,
-        setMessages,
-        nextMessageId,
+    setPending(true);
+    setStatusLabel("updating model...");
+    try {
+      await callRpc("model.select", {
+        model_id: params.modelId,
+        provider: params.modelProvider,
+        thinking_level: params.thinkingLevel,
+        openrouter_provider: params.openRouterProvider,
       });
-      setConversationProvider(null);
-      setActiveSession(null);
-    }
+      await refreshRuntimeState();
+      if (providerChanged) {
+        await callRpc("history.clear_session", {
+          session_id: getRpcSessionId(),
+        });
+        await refreshRuntimeSessionState();
+      }
 
-    const providerSuffix =
-      params.modelProvider === "openrouter"
-        ? ` | provider ${params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID}`
-        : "";
-    const selectedOption = findModelOption(params.modelProvider, params.modelId, modelOptionsByProvider);
-    const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
-    appendSystemMessage(
-      `model updated: ${params.modelLabel}${isAntigravityModel ? "" : ` (${params.thinkingLevel.toLowerCase()})`}${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
-    );
-    setInput("");
-    setSelector(null);
-  };
-
-  const openHistorySelector = () => {
-    const sessions = listChatSessions({ limit: 100 });
-    if (sessions.length === 0) {
-      appendSystemMessage("no saved chat history yet.");
-      return;
-    }
-
-    const options: HistoryOption[] = sessions.map((session) => ({
-      id: session.id,
-      label: session.title,
-      description:
-        `${session.provider} | ${modelIdToLabel(session.model).toLowerCase()} | ` +
-        `${session.messageCount} msgs | ${formatSessionTimestamp(session.updatedAt)} | ${session.id.slice(0, 8)}`,
-      session,
-    }));
-
-    setInput("");
-    setSelector({
-      kind: "history",
-      title: "resume chat history",
-      index: 0,
-      options,
-    });
-  };
-
-  const resumeSession = (session: ChatSessionRecord) => {
-    if (!enabledProviders.includes(session.provider)) {
-      setEnabledProviders((current) => dedupeAuthProviders([...current, session.provider]));
-    }
-
-    setSelectedModel(session.model);
-    setSelectedThinking(
-      normalizeThinkingForModel(
-        session.model,
-        session.provider,
-        session.thinkingLevel,
-        modelOptionsByProvider,
-      ),
-    );
-    if (session.provider === "openrouter") {
-      setSelectedOpenRouterProvider(
-        normalizeOpenRouterProviderSelection(session.openRouterProvider) || OPENROUTER_PROVIDER_ANY_ID,
+      const providerSuffix =
+        params.modelProvider === "openrouter"
+          ? ` | provider ${params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID}`
+          : "";
+      const selectedOption = findModelOption(params.modelProvider, params.modelId, modelOptionsByProvider);
+      const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+      appendSystemMessage(
+        `model updated: ${params.modelLabel}${isAntigravityModel ? "" : ` (${params.thinkingLevel.toLowerCase()})`}${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
       );
-    }
-
-    setHistory(session.messages);
-    setMessages(chatHistoryToUiMessages(session.messages, nextMessageId));
-    setConversationProvider(session.provider);
-    setActiveSession({
-      id: session.id,
-      title: session.title,
-      provider: session.provider,
-      model: session.model,
-      thinkingLevel: session.thinkingLevel,
-      openRouterProvider: session.openRouterProvider,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      messageCount: session.messageCount,
-      rolloutPath: session.rolloutPath,
-    });
-    setSelector(null);
-    setInput("");
-
-    appendSystemMessage(
-      `resumed chat ${session.id.slice(0, 8)} (${session.provider}, ${session.messageCount} msgs).`,
-    );
-
-    const resumedOption = findModelOption(session.provider, session.model, modelOptionsByProvider);
-    const isResumedAntigravityModel =
-      (resumedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity" ||
-      antigravityOpenAiModelOptions.some((option) => option.id === session.model);
-
-    if (session.provider === "openai" && !isResumedAntigravityModel && !openAiAccessToken.trim()) {
-      appendSystemMessage("this chat uses openai. run /auth before sending the next prompt.");
-    }
-    if (session.provider === "openrouter" && !openRouterApiKey.trim()) {
-      appendSystemMessage("this chat uses openrouter. run /auth before sending the next prompt.");
+      setInput("");
+      setSelector(null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(`model update failed: ${message}`);
+    } finally {
+      setPending(false);
+      setStatusLabel("ready");
     }
   };
 
-  const runHistoryCommand = (args: string[]) => {
+  const openHistorySelector = async () => {
+    try {
+      const history = await callRpc<RpcHistoryListResponse>("history.list", {
+        limit: 100,
+        cursor: 0,
+      });
+      const sessions = history.sessions;
+      if (sessions.length === 0) {
+        appendSystemMessage("no saved chat history yet.");
+        return;
+      }
+
+      const options: HistoryOption[] = sessions.map((session) => ({
+        id: session.id,
+        label: session.title,
+        description:
+          `${session.provider} | ${modelIdToLabel(session.model).toLowerCase()} | ` +
+          `${session.messageCount} msgs | ${formatSessionTimestamp(session.updatedAt)} | ${session.id.slice(0, 8)}`,
+        session,
+      }));
+
+      setInput("");
+      setSelector({
+        kind: "history",
+        title: "resume chat history",
+        index: 0,
+        options,
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(`history list failed: ${message}`);
+    }
+  };
+
+  const runHistoryCommand = async (args: string[]) => {
     if (args.length === 0 || args[0] === "list" || args[0] === "all") {
-      openHistorySelector();
+      await openHistorySelector();
       return;
     }
 
     const first = args[0]!.toLowerCase();
-    if (first === "last") {
-      const latest = loadLatestChatSession();
-      if (!latest) {
-        appendSystemMessage("no saved chat history yet.");
-        return;
-      }
-      resumeSession(latest);
-      return;
+    try {
+      await callRpc("command.execute", {
+        session_id: getRpcSessionId(),
+        raw_command: first === "last" ? "/history last" : `/history ${args[0]}`,
+      });
+      await refreshRuntimeState();
+      await refreshRuntimeSessionState();
+      setSelector(null);
+      setInput("");
+      appendSystemMessage(`resumed chat ${args[0] ?? "last"}.`);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(message);
+      void openHistorySelector();
     }
-
-    const byId = loadChatSessionById(args[0]!);
-    if (!byId) {
-      appendSystemMessage(`no saved chat matched id: ${args[0]}`);
-      openHistorySelector();
-      return;
-    }
-    resumeSession(byId);
   };
 
   const runStatusCommand = async () => {
@@ -1316,30 +1612,9 @@ function App() {
     setPending(true);
     setStatusLabel("fetching oauth usage...");
     try {
-      const [openAiResult, antigravityResult] = await Promise.all([
-        openAiToken
-          ? fetchOpenAiUsageSnapshot(openAiToken, openAiAccountId)
-            .then((snapshot) => ({
-              ok: true as const,
-              snapshot,
-            }))
-            .catch((error) => ({
-              ok: false as const,
-              message: error instanceof Error ? error.message : String(error),
-            }))
-          : Promise.resolve(null),
-        antigravityAccessToken
-          ? fetchAntigravityUsageSnapshot({ accessToken: antigravityAccessToken })
-            .then((snapshot) => ({
-              ok: true as const,
-              snapshot,
-            }))
-            .catch((error) => ({
-              ok: false as const,
-              message: error instanceof Error ? error.message : String(error),
-            }))
-          : Promise.resolve(null),
-      ]);
+      const limits = await callRpc<RpcLimitsResponse>("limits.get");
+      const openAiResult = limits.openai;
+      const antigravityResult = limits.antigravity;
 
       const outputBlocks: string[] = [];
       if (openAiResult) {
@@ -1369,7 +1644,7 @@ function App() {
     }
   };
 
-  const applyCommand = (rawCommand: string) => {
+  const applyCommand = async (rawCommand: string): Promise<void> => {
     const trimmed = rawCommand.trim();
     if (!trimmed) {
       return;
@@ -1392,42 +1667,27 @@ function App() {
     }
 
     if (command === "/forgeteverything") {
-      clearPersistedConfig();
-      setEnabledProviders([]);
-      setOpenAiAccessToken("");
-      setOpenAiAccountId(null);
-      setAntigravityOauthTokenInfo(null);
-      setAntigravityOauthProfile(null);
-      setOpenRouterApiKey("");
-      setExaApiKey("");
-      setSelectedOpenRouterProvider(OPENROUTER_PROVIDER_ANY_ID);
-      setModelOptionsByProvider(initialModelOptionsByProvider);
-      setSelectedModel("");
-      setSelectedThinking(loafConfig.thinkingLevel);
-      setPending(false);
-      setStatusLabel("ready");
-      setPendingImages([]);
-      setConversationProvider(null);
-      setHistory([]);
-      setActiveSession(null);
-      setInputHistory([]);
-      setInputHistoryIndex(null);
-      setInputHistoryDraft("");
-      setOnboardingCompleted(false);
-      setInput("");
-      setSelector({
-        kind: "onboarding",
-        title: "onboarding 1/2 - auth providers",
-        index: 0,
-        options: buildOnboardingAuthOptions([]),
-      });
-      setMessages([
-        {
-          id: nextMessageId(),
-          kind: "system",
-          text: "all local config was cleared. onboarding restarted.",
-        },
-      ]);
+      try {
+        await callRpc("command.execute", {
+          session_id: getRpcSessionId(),
+          raw_command: "/forgeteverything",
+        });
+        setPendingImages([]);
+        setInputHistory([]);
+        setInputHistoryIndex(null);
+        setInputHistoryDraft("");
+        await refreshRuntimeState();
+        await refreshRuntimeSessionState();
+        setSelector({
+          kind: "onboarding",
+          title: "onboarding 1/2 - auth providers",
+          index: 0,
+          options: buildOnboardingAuthOptions([]),
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`forgeteverything failed: ${message}`);
+      }
       return;
     }
 
@@ -1442,44 +1702,82 @@ function App() {
     }
 
     if (command === "/history") {
-      runHistoryCommand(args);
+      await runHistoryCommand(args);
       return;
     }
 
     if (command === "/clear") {
-      setMessages([]);
-      setHistory([]);
-      setConversationProvider(null);
-      setActiveSession(null);
-      setPendingImages([]);
+      try {
+        await callRpc("command.execute", {
+          session_id: getRpcSessionId(),
+          raw_command: "/clear",
+        });
+        setPendingImages([]);
+        await refreshRuntimeSessionState();
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`clear failed: ${message}`);
+      }
       return;
     }
 
     if (command === "/skills") {
-      const catalog = refreshSkillsCatalog();
-      if (catalog.skills.length === 0) {
-        appendSystemMessage(`no skills found in: ${catalog.directories.join(", ")}`);
-        return;
+      try {
+        const result = await callRpc<{
+          directories: string[];
+          skills: Array<{ name: string; description_preview: string }>;
+        }>("skills.list", {});
+        if (result.skills.length === 0) {
+          appendSystemMessage(`no skills found in: ${result.directories.join(", ")}`);
+          return;
+        }
+        const lines = result.skills
+          .map((skill) => `${skill.name} - ${skill.description_preview}`)
+          .join("\n");
+        appendSystemMessage(`available skills (${result.skills.length}):\n${lines}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`skills failed: ${message}`);
       }
-      const lines = catalog.skills
-        .map((skill) => `${skill.name} - ${skill.descriptionPreview}`)
-        .join("\n");
-      appendSystemMessage(`available skills (${catalog.skills.length}):\n${lines}`);
       return;
     }
 
     if (command === "/tools") {
-      const lines = defaultToolRegistry
-        .list()
-        .map((tool) => `${tool.name} - ${tool.description}`)
-        .join("\n");
-      appendSystemMessage(`registered tools:\n${lines}`);
+      try {
+        const result = await callRpc<{
+          tools: Array<{ name: string; description: string }>;
+        }>("tools.list", {});
+        const lines = result.tools
+          .map((tool) => `${tool.name} - ${tool.description}`)
+          .join("\n");
+        appendSystemMessage(`registered tools:\n${lines}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`tools failed: ${message}`);
+      }
       return;
     }
 
     if (command === "/help") {
-      const commandLines = COMMAND_OPTIONS.map((option) => `${option.name} - ${option.description}`).join("\n");
-      appendSystemMessage(`available commands:\n${commandLines}`);
+      try {
+        const result = await callRpc<{
+          handled: boolean;
+          output?: {
+            commands?: Array<{ name: string; description: string }>;
+          };
+        }>("command.execute", {
+          session_id: getRpcSessionId(),
+          raw_command: "/help",
+        });
+        const commands = result.output?.commands ?? [];
+        const commandLines = commands.length > 0
+          ? commands.map((option) => `${option.name} - ${option.description}`).join("\n")
+          : COMMAND_OPTIONS.map((option) => `${option.name} - ${option.description}`).join("\n");
+        appendSystemMessage(`available commands:\n${commandLines}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`help failed: ${message}`);
+      }
       return;
     }
 
@@ -1490,12 +1788,46 @@ function App() {
 
     if (command === SUPER_DEBUG_COMMAND) {
       const next = !superDebug;
-      setSuperDebug(next);
-      appendSystemMessage(`superdebug: ${next ? "on" : "off"}`);
+      try {
+        await callRpc("debug.set", {
+          super_debug: next,
+        });
+        setSuperDebug(next);
+        appendSystemMessage(`superdebug: ${next ? "on" : "off"}`);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`superdebug failed: ${message}`);
+      }
       return;
     }
 
-    appendSystemMessage(`unknown command: ${command}`);
+    try {
+      const result = await callRpc<{
+        handled: boolean;
+        output?: unknown;
+      }>("command.execute", {
+        session_id: getRpcSessionId(),
+        raw_command: trimmed,
+      });
+      if (!result.handled) {
+        appendSystemMessage(`unknown command: ${command}`);
+        return;
+      }
+      if (result.output && typeof result.output === "object" && "error" in result.output) {
+        const errorValue = (result.output as { error?: unknown }).error;
+        if (typeof errorValue === "string") {
+          appendSystemMessage(errorValue);
+          return;
+        }
+      }
+      if (result.output !== undefined) {
+        appendSystemMessage(safeJsonStringify(result.output));
+      }
+      await refreshRuntimeSessionState();
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      appendSystemMessage(`command failed: ${message}`);
+    }
   };
 
   const runSlashCommand = (rawInput: string) => {
@@ -1531,7 +1863,7 @@ function App() {
     setInput("");
     setInputHistoryIndex(null);
     setInputHistoryDraft("");
-    applyCommand(commandPayload);
+    void applyCommand(commandPayload);
     return true;
   };
 
@@ -1621,12 +1953,6 @@ function App() {
       const isSteerEnter = key.shift || character === "\n";
       const trimmed = input.trim();
 
-      if (!activeInferenceAbortControllerRef.current) {
-        appendSystemMessage("busy. wait for current operation to finish.");
-        suppressNextSubmitRef.current = true;
-        return;
-      }
-
       if (!trimmed) {
         appendSystemMessage(
           isSteerEnter
@@ -1663,7 +1989,7 @@ function App() {
       return;
     }
 
-    if (key.escape && pending && activeInferenceAbortControllerRef.current) {
+    if (key.escape && pending) {
       if (interruptActiveInference()) {
         appendSystemMessage("interrupt requested. waiting for current step to stop...");
       }
@@ -1763,19 +2089,27 @@ function App() {
             appendSystemMessage("exa api key cannot be empty. type 'skip' to skip.");
             return;
           }
-          const result = applyExaApiKeySelection(exaInput);
-          if (result === "invalid") {
-            appendSystemMessage("invalid exa api key input.");
-            return;
-          }
-          setInput("");
-          if (selector.returnToOnboarding) {
-            setOnboardingCompleted(true);
-            setSelector(null);
-            appendSystemMessage("onboarding complete. you can use /auth and /model any time.");
-          } else {
-            setSelector(null);
-          }
+          void (async () => {
+            const result = await applyExaApiKeySelection(exaInput);
+            if (result === "invalid") {
+              appendSystemMessage("invalid exa api key input.");
+              return;
+            }
+            setInput("");
+            if (selector.returnToOnboarding) {
+              try {
+                await callRpc("onboarding.complete", {});
+                await refreshRuntimeState();
+              } catch {
+                // keep local completion to avoid blocking the user if onboarding status refresh fails
+              }
+              setOnboardingCompleted(true);
+              setSelector(null);
+              appendSystemMessage("onboarding complete. you can use /auth and /model any time.");
+            } else {
+              setSelector(null);
+            }
+          })();
           return;
         }
 
@@ -1831,12 +2165,7 @@ function App() {
           if (!historyChoice) {
             return;
           }
-          const session = loadChatSession(historyChoice.session.rolloutPath);
-          if (!session) {
-            appendSystemMessage(`failed to load chat: ${historyChoice.session.id}`);
-            return;
-          }
-          resumeSession(session);
+          void runHistoryCommand([historyChoice.session.id]);
           return;
         }
 
@@ -1851,7 +2180,7 @@ function App() {
             setInput("");
             return;
           }
-          applyModelSelection({
+          void applyModelSelection({
             modelId: selector.modelId,
             modelLabel: selector.modelLabel,
             modelProvider: selector.modelProvider,
@@ -1892,7 +2221,7 @@ function App() {
               modelChoice.defaultThinkingLevel ??
               (thinkingOptions[defaultIndex]?.id as ThinkingLevel | undefined) ??
               "MEDIUM";
-            applyModelSelection({
+            void applyModelSelection({
               modelId: modelChoice.id,
               modelLabel: modelChoice.label,
               modelProvider: modelChoice.provider,
@@ -1922,28 +2251,20 @@ function App() {
           if (selector.modelProvider === "openrouter") {
             void (async () => {
               let discoveredProviders: string[] = [];
-              if (openRouterApiKey.trim()) {
-                setPending(true);
-                setStatusLabel("loading providers...");
-                try {
-                  discoveredProviders = await listOpenRouterProvidersForModel(openRouterApiKey, selector.modelId);
-                  if (discoveredProviders.length > 0) {
-                    setModelOptionsByProvider((current) => ({
-                      ...current,
-                      openrouter: current.openrouter.map((option) =>
-                        option.id === selector.modelId
-                          ? { ...option, routingProviders: discoveredProviders }
-                          : option,
-                      ),
-                    }));
-                  }
-                } catch (error) {
-                  const message = error instanceof Error ? error.message : String(error);
-                  appendSystemMessage(`openrouter provider fetch failed: ${message}`);
-                } finally {
-                  setPending(false);
-                  setStatusLabel("ready");
-                }
+              setPending(true);
+              setStatusLabel("loading providers...");
+              try {
+                const result = await callRpc<{ model_id: string; providers: string[] }>("model.openrouter.providers", {
+                  model_id: selector.modelId,
+                });
+                discoveredProviders = result.providers;
+                await refreshRuntimeState();
+              } catch (error) {
+                const message = error instanceof Error ? error.message : String(error);
+                appendSystemMessage(`openrouter provider fetch failed: ${message}`);
+              } finally {
+                setPending(false);
+                setStatusLabel("ready");
               }
 
               const routeOptions = getOpenRouterProviderOptions(
@@ -1970,7 +2291,7 @@ function App() {
             return;
           }
 
-          applyModelSelection({
+          void applyModelSelection({
             modelId: selector.modelId,
             modelLabel: selector.modelLabel,
             modelProvider: selector.modelProvider,
@@ -1984,7 +2305,7 @@ function App() {
           if (!routeChoice) {
             return;
           }
-          applyModelSelection({
+          void applyModelSelection({
             modelId: selector.modelId,
             modelLabel: selector.modelLabel,
             modelProvider: selector.modelProvider,
@@ -2101,9 +2422,7 @@ function App() {
 
   const sendPrompt = async (prompt: string) => {
     const cleanPrompt = prompt.trim();
-    const promptImages = pendingImages;
-    const promptWithImageRefs = appendMissingImagePlaceholders(cleanPrompt, promptImages.length);
-    if ((!cleanPrompt && promptImages.length === 0) || pending) {
+    if ((!cleanPrompt && pendingImages.length === 0) || pending) {
       return;
     }
     if (!onboardingCompleted) {
@@ -2111,45 +2430,17 @@ function App() {
       openOnboardingSelector();
       return;
     }
-    const provider = selectedModelProvider;
-    if (!provider) {
+    if (!selectedModelProvider) {
       appendSystemMessage("select a model from an enabled provider first.");
       openAuthSelector(false, true);
       return;
     }
-    const selectedOption = findModelOption(provider, selectedModel, modelOptionsByProvider);
-    const isAntigravityModel =
-      (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
 
-    const hasProviderAccess =
-      enabledProviders.includes(provider) || (isAntigravityModel && provider === "openai");
-    if (!hasProviderAccess) {
-      appendSystemMessage(`provider ${provider} is not enabled. run /auth to add it.`);
-      openAuthSelector(false, true);
-      return;
-    }
-    if (isAntigravityModel && !antigravityAccessToken) {
-      appendSystemMessage("antigravity model selected, but no antigravity oauth token is available. run /auth.");
-      openAuthSelector(false, true);
-      return;
-    }
-    if (!isAntigravityModel && provider === "openai" && !openAiAccessToken.trim()) {
-      appendSystemMessage("openai model selected, but no chatgpt oauth token is available. run /auth.");
-      openAuthSelector(false, true);
-      return;
-    }
-    if (provider === "openrouter" && !openRouterApiKey.trim()) {
-      appendSystemMessage("openrouter model selected, but no openrouter api key is available. run /auth.");
-      openAuthSelector(false, true);
-      return;
-    }
-    const skillCatalog = refreshSkillsCatalog();
-    const skillPromptContext = buildSkillPromptContext(promptWithImageRefs, skillCatalog.skills);
-    if (skillPromptContext.selection.combined.length > 0) {
-      appendSystemMessage(
-        `skills applied: ${skillPromptContext.selection.combined.map((skill) => skill.name).join(", ")}`,
-      );
-    }
+    const promptImages = pendingImages.map((image) => ({
+      path: image.path,
+      mime_type: image.mimeType,
+      data_url: image.dataUrl,
+    }));
 
     setInput("");
     if (cleanPrompt) {
@@ -2161,496 +2452,19 @@ function App() {
     setInputHistoryIndex(null);
     setInputHistoryDraft("");
     setPendingImages([]);
-    setPending(true);
-    setStatusLabel(selectedThinking === "OFF" ? "drafting response..." : "thinking...");
-    steeringQueueRef.current = [];
-    const inferenceAbortController = new AbortController();
-    activeInferenceAbortControllerRef.current = inferenceAbortController;
-
-    const providerSwitchRequiresReset =
-      conversationProvider !== null && conversationProvider !== provider && history.length > 0;
-    const historyBase = providerSwitchRequiresReset ? [] : history;
-    if (providerSwitchRequiresReset) {
-      resetConversationForProviderSwitch({
-        fromProvider: conversationProvider,
-        toProvider: provider,
-        setHistory,
-        setMessages,
-        nextMessageId,
-      });
-      setActiveSession(null);
-    }
-
-    const normalizedOpenRouterProvider =
-      !isAntigravityModel && provider === "openrouter"
-        ? normalizeOpenRouterProviderSelection(selectedOpenRouterProvider)
-        : undefined;
-    const needsNewSession =
-      historyBase.length === 0 || !activeSession || activeSession.provider !== provider;
-    let sessionForTurn = activeSession;
-    if (needsNewSession) {
-      try {
-        sessionForTurn = createChatSession({
-          provider,
-          model: selectedModel,
-          thinkingLevel: selectedThinking,
-          openRouterProvider: normalizedOpenRouterProvider,
-          titleHint:
-            cleanPrompt ||
-            (promptImages.length > 0 ? `image: ${path.basename(promptImages[0]!.path)}` : undefined),
-        });
-        setActiveSession(sessionForTurn);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        appendSystemMessage(`history save disabled for this turn: ${message}`);
-        sessionForTurn = null;
-        setActiveSession(null);
-      }
-    }
-
-    const nextHistory = [
-      ...historyBase,
-      {
-        role: "user" as const,
-        text: promptWithImageRefs,
-        images: promptImages.length > 0 ? promptImages : undefined,
-      },
-    ];
-    const modelHistory: ChatMessage[] = [
-      ...mapMessagesForModel(historyBase, skillCatalog.skills),
-      {
-        role: "user",
-        text: skillPromptContext.modelPrompt,
-        images: promptImages.length > 0 ? promptImages : undefined,
-      },
-    ];
-    const nextUserMessage: UiMessage = {
-      id: nextMessageId(),
-      kind: "user",
-      text: promptWithImageRefs,
-      images: promptImages.length > 0 ? promptImages : undefined,
-    };
-    setMessages((current) => [...current, nextUserMessage]);
-
-    let assistantDraftText = "";
-    const appliedSteeringMessages: ChatMessage[] = [];
-    let emittedAssistantChars = 0;
-    const pendingToolMessageIds: number[] = [];
-    let hasIncrementalToolLifecycleEvents = false;
-
-    const emitAssistantSinceBoundary = (fullText: string) => {
-      const next = consumeAssistantBoundary({
-        fullText,
-        emittedChars: emittedAssistantChars,
-      });
-      const delta = next.delta;
-      emittedAssistantChars = next.emittedChars;
-      if (!delta.trim()) {
-        return;
-      }
-      setMessages((current) => [
-        ...current,
-        {
-          id: nextMessageId(),
-          kind: "assistant",
-          text: delta,
-        },
-      ]);
-    };
-
-    const appendAssistantDraftDelta = (deltaText: string) => {
-      if (!deltaText) {
-        return;
-      }
-      assistantDraftText += deltaText;
-    };
-
-    const drainSteeringMessages = (): ChatMessage[] => {
-      const queued = steeringQueueRef.current;
-      if (queued.length === 0) {
-        return [];
-      }
-      steeringQueueRef.current = [];
-      appliedSteeringMessages.push(...queued);
-      setMessages((current) => [
-        ...current,
-        ...queued.map((message) => ({
-          id: nextMessageId(),
-          kind: "user" as const,
-          text: message.text,
-        })),
-      ]);
-      setStatusLabel("steer applied; continuing...");
-      return queued;
-    };
 
     try {
-      const handleChunk = (chunk: StreamChunk) => {
-        const segments = Array.isArray(chunk.segments) ? chunk.segments : [];
-        if (segments.length > 0) {
-          let thoughtIndex = 0;
-          for (const segment of segments) {
-            if (segment.kind === "thought") {
-              // Codex-style interleaving boundary: when reasoning resumes after
-              // assistant output, finalize the current assistant segment first.
-              emitAssistantSinceBoundary(assistantDraftText);
-              const thoughtText =
-                chunk.thoughts[thoughtIndex] ??
-                chunk.thoughts[chunk.thoughts.length - 1] ??
-                segment.text;
-              thoughtIndex += 1;
-              const title = parseThoughtTitle(thoughtText);
-              setStatusLabel(`thinking: ${title}`);
-              continue;
-            }
-
-            if (segment.kind === "answer" && segment.text) {
-              appendAssistantDraftDelta(segment.text);
-              setStatusLabel("drafting response...");
-            }
-          }
-          return;
-        }
-
-        if (chunk.thoughts.length > 0) {
-          // Fallback for providers that only populate `thoughts` without
-          // explicit segment metadata.
-          emitAssistantSinceBoundary(assistantDraftText);
-        }
-        for (const rawThought of chunk.thoughts) {
-          const title = parseThoughtTitle(rawThought);
-          setStatusLabel(`thinking: ${title}`);
-        }
-
-        if (chunk.answerText) {
-          appendAssistantDraftDelta(chunk.answerText);
-          setStatusLabel("drafting response...");
-        }
-      };
-
-      const handleDebug = (event: DebugEvent) => {
-        if (event.stage === "tool_call_started") {
-          hasIncrementalToolLifecycleEvents = true;
-          emitAssistantSinceBoundary(assistantDraftText);
-          const row = formatToolStartRow(event.data);
-          if (row) {
-            const messageId = nextMessageId();
-            pendingToolMessageIds.push(messageId);
-            setMessages((current) => [
-              ...current,
-              {
-                id: messageId,
-                kind: "system",
-                text: row,
-              },
-            ]);
-          }
-        }
-
-        if (event.stage === "tool_call_completed") {
-          hasIncrementalToolLifecycleEvents = true;
-          emitAssistantSinceBoundary(assistantDraftText);
-          const row = formatToolCompletedRow(event.data);
-          if (row) {
-            const pendingId = pendingToolMessageIds.shift();
-            if (typeof pendingId === "number") {
-              setMessages((current) =>
-                current.map((message) =>
-                  message.id === pendingId
-                    ? {
-                      ...message,
-                      text: row,
-                    }
-                    : message,
-                ),
-              );
-            } else {
-              setMessages((current) => [
-                ...current,
-                {
-                  id: nextMessageId(),
-                  kind: "system",
-                  text: row,
-                },
-              ]);
-            }
-          }
-        }
-
-        if (event.stage === "tool_calls") {
-          if (hasIncrementalToolLifecycleEvents) {
-            appendDebugEvent(event);
-            return;
-          }
-          // Incremental tool lifecycle (`tool_call_started` / `tool_call_completed`)
-          // is now the primary rendering path. Keep this branch as a
-          // compatibility no-op so we don't duplicate rows when both events fire.
-          emitAssistantSinceBoundary(assistantDraftText);
-          appendDebugEvent(event);
-          return;
-        }
-
-        if (event.stage === "tool_results") {
-          const toolRows = formatToolRows(event.data);
-          if (hasIncrementalToolLifecycleEvents) {
-            if (pendingToolMessageIds.length > 0 && toolRows.length > 0) {
-              const replacementPlan = buildToolReplacement({
-                pendingIds: pendingToolMessageIds,
-                toolRows,
-              });
-              const replacementMap = new Map<number, string>(
-                replacementPlan.replacements.map((item) => [item.id, item.row]),
-              );
-              if (replacementMap.size > 0) {
-                setMessages((current) =>
-                  current.map((message) => {
-                    const replacement = replacementMap.get(message.id);
-                    if (!replacement) {
-                      return message;
-                    }
-                    return {
-                      ...message,
-                      text: replacement,
-                    };
-                  }),
-                );
-              }
-              pendingToolMessageIds.splice(0, replacementPlan.consumed);
-            }
-            appendDebugEvent(event);
-            return;
-          }
-
-          emitAssistantSinceBoundary(assistantDraftText);
-          if (toolRows.length > 0) {
-            if (pendingToolMessageIds.length > 0) {
-              const replacementPlan = buildToolReplacement({
-                pendingIds: pendingToolMessageIds,
-                toolRows,
-              });
-              const replacementMap = new Map<number, string>(
-                replacementPlan.replacements.map((item) => [item.id, item.row]),
-              );
-              const extraRows = replacementPlan.extraRows;
-              setMessages((current) => {
-                const updated = current.map((message) => {
-                  const replacement = replacementMap.get(message.id);
-                  if (!replacement) {
-                    return message;
-                  }
-                  return {
-                    ...message,
-                    text: replacement,
-                  };
-                });
-                if (extraRows.length === 0) {
-                  return updated;
-                }
-                return [
-                  ...updated,
-                  ...extraRows.map((row) => ({
-                    id: nextMessageId(),
-                    kind: "system" as const,
-                    text: row,
-                  })),
-                ];
-              });
-              pendingToolMessageIds.splice(0, replacementPlan.consumed);
-            } else {
-              setMessages((current) => [
-                ...current,
-                ...toolRows.map((row) => ({
-                  id: nextMessageId(),
-                  kind: "system" as const,
-                  text: row,
-                })),
-              ]);
-            }
-          }
-        }
-        appendDebugEvent(event);
-      };
-      const runtimeSystemInstruction = buildRuntimeSystemInstruction({
-        baseInstruction: loafConfig.systemInstruction,
-        hasExaSearch: Boolean(exaApiKey.trim()),
-        skillInstructionBlock: skillPromptContext.instructionBlock,
+      await callRpc("session.send", {
+        session_id: getRpcSessionId(),
+        text: cleanPrompt,
+        images: promptImages,
+        enqueue: false,
       });
-
-      const result =
-        isAntigravityModel
-          ? await runAntigravityInferenceStream(
-            {
-              accessToken: antigravityAccessToken,
-              model: selectedModel,
-              messages: modelHistory,
-              thinkingLevel: selectedThinking,
-              includeThoughts: selectedThinking !== "OFF",
-              systemInstruction: runtimeSystemInstruction,
-              signal: inferenceAbortController.signal,
-              drainSteeringMessages,
-            },
-            handleChunk,
-            handleDebug,
-          )
-          : provider === "openrouter"
-            ? await runOpenRouterInferenceStream(
-              {
-                apiKey: openRouterApiKey,
-                model: selectedModel,
-                messages: modelHistory,
-                thinkingLevel: selectedThinking,
-                includeThoughts: selectedThinking !== "OFF",
-                forcedProvider:
-                  normalizeOpenRouterProviderSelection(selectedOpenRouterProvider) === OPENROUTER_PROVIDER_ANY_ID
-                    ? null
-                    : normalizeOpenRouterProviderSelection(selectedOpenRouterProvider),
-                systemInstruction: runtimeSystemInstruction,
-                signal: inferenceAbortController.signal,
-                drainSteeringMessages,
-              },
-              handleChunk,
-              handleDebug,
-            )
-            : await runOpenAiInferenceStream(
-              {
-                accessToken: openAiAccessToken,
-                chatgptAccountId: openAiAccountId,
-                model: selectedModel,
-                messages: modelHistory,
-                thinkingLevel: selectedThinking,
-                includeThoughts: selectedThinking !== "OFF",
-                systemInstruction: runtimeSystemInstruction,
-                sessionId: sessionForTurn?.id,
-                signal: inferenceAbortController.signal,
-                drainSteeringMessages,
-              },
-              handleChunk,
-              handleDebug,
-            );
-
-      const finalAssistantText = assistantDraftText || result.answer;
-      assistantDraftText = finalAssistantText;
-      emitAssistantSinceBoundary(finalAssistantText);
-      const assistantMessage: ChatMessage = {
-        role: "assistant",
-        text: finalAssistantText,
-      };
-      const savedHistory = [...nextHistory, ...appliedSteeringMessages, assistantMessage];
-      setHistory(savedHistory);
-      setConversationProvider(provider);
-
-      if (sessionForTurn) {
-        try {
-          const updatedSession = writeChatSession({
-            session: sessionForTurn,
-            messages: savedHistory,
-            provider,
-            model: selectedModel,
-            thinkingLevel: selectedThinking,
-            openRouterProvider: normalizedOpenRouterProvider,
-            titleHint: cleanPrompt,
-          });
-          setActiveSession(updatedSession);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          appendSystemMessage(`chat history save failed: ${message}`);
-        }
-      }
-
-      if (!finalAssistantText.trim() && emittedAssistantChars === 0) {
-        setMessages((current) => [
-          ...current,
-          {
-            id: nextMessageId(),
-            kind: "assistant",
-            text: "(No response text returned)",
-          },
-        ]);
-      }
-
     } catch (error) {
-      if (isAbortError(error)) {
-        const interruptedAssistant = assistantDraftText.trim();
-        const interruptedHistoryBase = [...nextHistory, ...appliedSteeringMessages];
-        const interruptedHistory = interruptedAssistant
-          ? [...interruptedHistoryBase, { role: "assistant" as const, text: interruptedAssistant }]
-          : interruptedHistoryBase;
-        setHistory(interruptedHistory);
-        setConversationProvider(provider);
-
-        if (sessionForTurn) {
-          try {
-            const updatedSession = writeChatSession({
-              session: sessionForTurn,
-              messages: interruptedHistory,
-              provider,
-              model: selectedModel,
-              thinkingLevel: selectedThinking,
-              openRouterProvider: normalizedOpenRouterProvider,
-              titleHint: cleanPrompt,
-            });
-            setActiveSession(updatedSession);
-          } catch (sessionError) {
-            const message = sessionError instanceof Error ? sessionError.message : String(sessionError);
-            appendSystemMessage(`chat history save failed: ${message}`);
-          }
-        }
-
-        emitAssistantSinceBoundary(interruptedAssistant);
-        if (interruptedAssistant && emittedAssistantChars === 0) {
-          setMessages((current) => [
-            ...current,
-            {
-              id: nextMessageId(),
-              kind: "assistant",
-              text: interruptedAssistant,
-            },
-          ]);
-        }
-
-        appendSystemMessage(
-          interruptedAssistant
-            ? "response interrupted by user. partial output kept."
-            : "response interrupted by user.",
-        );
-        return;
-      }
-
       const message = error instanceof Error ? error.message : String(error);
-      emitAssistantSinceBoundary(assistantDraftText);
-      setMessages((current) => [
-        ...current,
-        {
-          id: nextMessageId(),
-          kind: "system",
-          text: `inference error: ${message}`,
-        },
-      ]);
-    } finally {
-      const unappliedSteerCount = steeringQueueRef.current.length;
-      steeringQueueRef.current = [];
-      activeInferenceAbortControllerRef.current = null;
-      setPending(false);
-      setStatusLabel("ready");
-      if (unappliedSteerCount > 0) {
-        appendSystemMessage(
-          `${unappliedSteerCount} steer message(s) were queued too late and not applied.`,
-        );
-      }
+      appendSystemMessage(`send failed: ${message}`);
     }
   };
-
-  useEffect(() => {
-    if (pending) {
-      return;
-    }
-    const nextQueuedPrompt = queuedPromptsRef.current.shift();
-    if (!nextQueuedPrompt) {
-      return;
-    }
-    setQueuedPromptsVersion((current) => current + 1);
-    void sendPrompt(nextQueuedPrompt);
-  }, [pending, queuedPromptsVersion]);
 
   if (!secretsHydrated) {
     return (
@@ -2844,10 +2658,6 @@ function App() {
             }
 
             if (pending) {
-              if (!activeInferenceAbortControllerRef.current) {
-                appendSystemMessage("busy. wait for current operation to finish.");
-                return;
-              }
               if (!trimmed) {
                 appendSystemMessage("cannot queue an empty prompt while running.");
                 return;

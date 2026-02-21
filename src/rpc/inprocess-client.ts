@@ -47,6 +47,6 @@ export class InProcessRpcClient {
 }
 
 export async function createInProcessRpcClient(): Promise<InProcessRpcClient> {
-  const runtime = await LoafCoreRuntime.create({ rpcMode: false });
+  const runtime = await LoafCoreRuntime.create({ rpcMode: true });
   return new InProcessRpcClient(runtime);
 }
