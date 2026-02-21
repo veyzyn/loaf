@@ -4,6 +4,11 @@ import http from "node:http";
 import path from "node:path";
 import { spawn } from "node:child_process";
 import { getLoafDataDir } from "./persistence.js";
+import { SECRET_ACCOUNT_OPENAI_CHATGPT_AUTH } from "./secret-accounts.js";
+import {
+  getSecureValue,
+  setSecureValue,
+} from "./secure-store.js";
 
 const DEFAULT_ISSUER = "https://auth.openai.com";
 const DEFAULT_CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann";
@@ -23,9 +28,9 @@ export type OpenAiAuthJson = {
   auth_mode?: "chatgpt";
   OPENAI_API_KEY?: string;
   tokens?: {
-    id_token: string;
-    access_token: string;
-    refresh_token: string;
+    id_token?: string;
+    access_token?: string;
+    refresh_token?: string;
     account_id?: string;
   };
   last_refresh?: string;
@@ -57,6 +62,15 @@ export type OpenAiOauthLoginResult = {
   loginMethod: "browser" | "device_code";
 };
 
+type StoredOpenAiChatgptSecrets = {
+  version: 1;
+  accessToken: string;
+  accountId?: string | null;
+  refreshToken?: string;
+  idToken?: string;
+  apiKey?: string;
+};
+
 export type OpenAiDeviceCodeInfo = {
   verificationUrl: string;
   userCode: string;
@@ -84,15 +98,11 @@ export function loadOpenAiAuthFromDisk(): OpenAiAuthJson | null {
     const apiKey = typeof parsed.OPENAI_API_KEY === "string" ? parsed.OPENAI_API_KEY.trim() : "";
     const tokens = parsed.tokens;
     const normalizedTokens =
-      tokens &&
-      typeof tokens === "object" &&
-      typeof tokens.id_token === "string" &&
-      typeof tokens.access_token === "string" &&
-      typeof tokens.refresh_token === "string"
+      tokens && typeof tokens === "object"
         ? {
-            id_token: tokens.id_token,
-            access_token: tokens.access_token,
-            refresh_token: tokens.refresh_token,
+            id_token: typeof tokens.id_token === "string" ? tokens.id_token : undefined,
+            access_token: typeof tokens.access_token === "string" ? tokens.access_token : undefined,
+            refresh_token: typeof tokens.refresh_token === "string" ? tokens.refresh_token : undefined,
             account_id: typeof tokens.account_id === "string" ? tokens.account_id : undefined,
           }
         : undefined;
@@ -109,28 +119,37 @@ export function loadOpenAiAuthFromDisk(): OpenAiAuthJson | null {
 }
 
 export function getPersistedOpenAiChatgptAuth(): OpenAiChatgptAuth | null {
-  const auth = loadOpenAiAuthFromDisk();
-  if (!auth) {
+  return normalizePersistedOpenAiAuth(loadOpenAiAuthFromDisk());
+}
+
+export async function loadPersistedOpenAiChatgptAuth(): Promise<OpenAiChatgptAuth | null> {
+  const fromSecureStore = await loadOpenAiChatgptAuthFromSecureStore();
+  if (fromSecureStore) {
+    const authFromDisk = loadOpenAiAuthFromDisk();
+    if (hasLegacySecretsInAuthFile(authFromDisk)) {
+      writeOpenAiAuthMetadata({
+        accountId: fromSecureStore.accountId,
+        lastRefresh: authFromDisk?.last_refresh,
+      });
+    }
+    return fromSecureStore;
+  }
+
+  const authFromDisk = loadOpenAiAuthFromDisk();
+  const fromLegacyDisk = normalizePersistedOpenAiAuth(authFromDisk);
+  if (!fromLegacyDisk) {
     return null;
   }
 
-  const accessToken = auth?.tokens?.access_token?.trim();
-  if (!accessToken) {
-    return null;
+  const migrated = await persistOpenAiAuthToSecureStore(fromLegacyDisk);
+  if (migrated) {
+    writeOpenAiAuthMetadata({
+      accountId: fromLegacyDisk.accountId,
+      lastRefresh: authFromDisk?.last_refresh,
+    });
   }
 
-  const accountId =
-    auth.tokens?.account_id?.trim() ||
-    readChatGptAccountId(auth.tokens?.id_token ?? "") ||
-    null;
-
-  return {
-    accessToken,
-    accountId,
-    refreshToken: auth.tokens?.refresh_token,
-    idToken: auth.tokens?.id_token,
-    apiKey: auth.OPENAI_API_KEY,
-  };
+  return fromLegacyDisk;
 }
 
 export async function runOpenAiOauthLogin(
@@ -319,7 +338,7 @@ async function runOpenAiDeviceCodeLogin(options: {
   }
 
   const accountId = readChatGptAccountId(tokens.id_token);
-  const authFilePath = persistOpenAiAuth({
+  const authFilePath = await persistOpenAiAuth({
     apiKey,
     accountId,
     idToken: tokens.id_token,
@@ -637,7 +656,7 @@ async function handleOAuthRequest(
   }
 
   const accountId = readChatGptAccountId(tokens.id_token);
-  const authFilePath = persistOpenAiAuth({
+  const authFilePath = await persistOpenAiAuth({
     apiKey,
     accountId,
     idToken: tokens.id_token,
@@ -736,13 +755,134 @@ async function exchangeIdTokenForApiKey(params: {
   return apiKey;
 }
 
-function persistOpenAiAuth(params: {
+async function loadOpenAiChatgptAuthFromSecureStore(): Promise<OpenAiChatgptAuth | null> {
+  const raw = await getSecureValue(SECRET_ACCOUNT_OPENAI_CHATGPT_AUTH);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as Partial<StoredOpenAiChatgptSecrets>;
+    if (!parsed || typeof parsed !== "object" || parsed.version !== 1) {
+      return null;
+    }
+
+    const accessToken = typeof parsed.accessToken === "string" ? parsed.accessToken.trim() : "";
+    if (!accessToken) {
+      return null;
+    }
+
+    const idToken = typeof parsed.idToken === "string" ? parsed.idToken : undefined;
+    const accountId =
+      typeof parsed.accountId === "string"
+        ? parsed.accountId
+        : (parsed.accountId ?? readChatGptAccountId(idToken ?? "")) || null;
+    const refreshToken = typeof parsed.refreshToken === "string" ? parsed.refreshToken : undefined;
+    const apiKey = typeof parsed.apiKey === "string" ? parsed.apiKey : undefined;
+
+    return {
+      accessToken,
+      accountId,
+      refreshToken,
+      idToken,
+      apiKey,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function normalizePersistedOpenAiAuth(auth: OpenAiAuthJson | null): OpenAiChatgptAuth | null {
+  if (!auth) {
+    return null;
+  }
+
+  const accessToken = auth.tokens?.access_token?.trim();
+  if (!accessToken) {
+    return null;
+  }
+
+  const idToken = auth.tokens?.id_token;
+  const accountId = auth.tokens?.account_id?.trim() || readChatGptAccountId(idToken ?? "") || null;
+  const refreshToken = auth.tokens?.refresh_token?.trim() || undefined;
+  const apiKey = auth.OPENAI_API_KEY?.trim() || undefined;
+
+  return {
+    accessToken,
+    accountId,
+    refreshToken,
+    idToken,
+    apiKey,
+  };
+}
+
+function hasLegacySecretsInAuthFile(auth: OpenAiAuthJson | null): boolean {
+  if (!auth) {
+    return false;
+  }
+  return Boolean(
+    auth.OPENAI_API_KEY?.trim() ||
+      auth.tokens?.access_token?.trim() ||
+      auth.tokens?.refresh_token?.trim() ||
+      auth.tokens?.id_token?.trim(),
+  );
+}
+
+async function persistOpenAiAuthToSecureStore(auth: OpenAiChatgptAuth): Promise<boolean> {
+  const payload: StoredOpenAiChatgptSecrets = {
+    version: 1,
+    accessToken: auth.accessToken.trim(),
+    accountId: auth.accountId,
+    refreshToken: auth.refreshToken?.trim() || undefined,
+    idToken: auth.idToken?.trim() || undefined,
+    apiKey: auth.apiKey?.trim() || undefined,
+  };
+  if (!payload.accessToken) {
+    return false;
+  }
+
+  return setSecureValue(SECRET_ACCOUNT_OPENAI_CHATGPT_AUTH, JSON.stringify(payload));
+}
+
+function writeOpenAiAuthMetadata(params: { accountId: string | null; lastRefresh?: string }): string {
+  const payload: OpenAiAuthJson = {
+    auth_mode: "chatgpt",
+    tokens: {
+      account_id: params.accountId || undefined,
+    },
+    last_refresh: params.lastRefresh || new Date().toISOString(),
+  };
+
+  const authFilePath = getOpenAiAuthFilePath();
+  fs.mkdirSync(path.dirname(authFilePath), { recursive: true });
+  fs.writeFileSync(authFilePath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
+  return authFilePath;
+}
+
+async function persistOpenAiAuth(params: {
   apiKey?: string;
   accountId: string | null;
   idToken: string;
   accessToken: string;
   refreshToken: string;
-}): string {
+}): Promise<string> {
+  const auth: OpenAiChatgptAuth = {
+    accessToken: params.accessToken,
+    accountId: params.accountId,
+    refreshToken: params.refreshToken,
+    idToken: params.idToken,
+    apiKey: params.apiKey,
+  };
+
+  const secureStored = await persistOpenAiAuthToSecureStore(auth);
+  const lastRefresh = new Date().toISOString();
+  if (secureStored) {
+    return writeOpenAiAuthMetadata({
+      accountId: params.accountId,
+      lastRefresh,
+    });
+  }
+
   const payload: OpenAiAuthJson = {
     auth_mode: "chatgpt",
     OPENAI_API_KEY: params.apiKey,
@@ -752,7 +892,7 @@ function persistOpenAiAuth(params: {
       refresh_token: params.refreshToken,
       account_id: params.accountId || undefined,
     },
-    last_refresh: new Date().toISOString(),
+    last_refresh: lastRefresh,
   };
 
   const authFilePath = getOpenAiAuthFilePath();

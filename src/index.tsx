@@ -7,12 +7,27 @@ import { Box, Newline, render, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 import { loafConfig, type AuthProvider, type ThinkingLevel } from "./config.js";
 import {
+  loadPersistedRuntimeSecrets,
   clearPersistedConfig,
   loadPersistedState,
+  persistRuntimeSecrets,
   savePersistedState,
   type LoafPersistedState,
 } from "./persistence.js";
-import { getPersistedOpenAiChatgptAuth, runOpenAiOauthLogin } from "./openai-oauth.js";
+import { loadPersistedOpenAiChatgptAuth, runOpenAiOauthLogin } from "./openai-oauth.js";
+import {
+  fetchAntigravityProfileData,
+  loadPersistedAntigravityOauthTokenInfo,
+  runAntigravityOauthLogin,
+  type AntigravityOauthProfile,
+  type AntigravityOauthTokenInfo,
+} from "./antigravity-oauth.js";
+import {
+  antigravityModelToThinkingLevels,
+  discoverAntigravityModelOptions,
+  type AntigravityDiscoveredModel,
+} from "./antigravity-models.js";
+import { runAntigravityInferenceStream } from "./antigravity.js";
 import {
   createChatSession,
   listChatSessions,
@@ -50,10 +65,12 @@ type UiMessage = {
 };
 
 type AuthOption = {
-  id: AuthProvider;
+  id: AuthSelection;
   label: string;
   description: string;
 };
+
+type AuthSelection = AuthProvider | "antigravity";
 
 type ThinkingOption = {
   id: string;
@@ -158,18 +175,7 @@ type SelectorState =
       openRouterProvider?: string;
     };
 
-const AUTH_OPTIONS: AuthOption[] = [
-  {
-    id: "openai",
-    label: "openai oauth",
-    description: "chatgpt account login (codex auth flow)",
-  },
-  {
-    id: "openrouter",
-    label: "openrouter api key",
-    description: "enter your openrouter key in /auth",
-  },
-];
+const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "openrouter"];
 
 const THINKING_OPTION_DETAILS: Record<ThinkingLevel, { label: string; description: string }> = {
   OFF: { label: "off", description: "disable reasoning effort" },
@@ -214,6 +220,9 @@ const COMMAND_OPTIONS: CommandOption[] = [
 const SUPER_DEBUG_COMMAND = "/superdebug-69";
 const MAX_INPUT_HISTORY = 200;
 const MAX_VISIBLE_MESSAGES = 14;
+const MIN_VISIBLE_MESSAGE_ROWS = 2;
+const BASE_LAYOUT_ROWS = 8;
+const SELECTOR_WINDOW_SIZE = 10;
 const MAX_PENDING_IMAGES = 4;
 const MAX_IMAGE_FILE_BYTES = 8 * 1024 * 1024;
 const CLIPBOARD_IMAGE_CAPTURE_MAX_BUFFER = MAX_IMAGE_FILE_BYTES + 512 * 1024;
@@ -249,11 +258,10 @@ function App() {
     [],
   );
   const persistedState = useMemo(() => loadPersistedState(), []);
-  const initialOpenAiAuth = getPersistedOpenAiChatgptAuth();
   const initialEnabledProviders = resolveInitialEnabledProviders({
     persistedProviders: persistedState?.authProviders,
     legacyProvider: persistedState?.authProvider,
-    hasOpenAiToken: Boolean(initialOpenAiAuth?.accessToken),
+    hasOpenAiToken: false,
     hasOpenRouterKey: Boolean((persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey).trim()),
   });
   const initialModel = resolveInitialModel(
@@ -282,10 +290,16 @@ function App() {
   const [pending, setPending] = useState(false);
   const [statusLabel, setStatusLabel] = useState("ready");
   const [superDebug, setSuperDebug] = useState(false);
+  const [secretsHydrated, setSecretsHydrated] = useState(false);
   const [onboardingCompleted, setOnboardingCompleted] = useState<boolean>(initialOnboardingCompleted);
   const [enabledProviders, setEnabledProviders] = useState<AuthProvider[]>(initialEnabledProviders);
-  const [openAiAccessToken, setOpenAiAccessToken] = useState(initialOpenAiAuth?.accessToken ?? "");
-  const [openAiAccountId, setOpenAiAccountId] = useState<string | null>(initialOpenAiAuth?.accountId ?? null);
+  const [openAiAccessToken, setOpenAiAccessToken] = useState("");
+  const [openAiAccountId, setOpenAiAccountId] = useState<string | null>(null);
+  const [antigravityOauthTokenInfo, setAntigravityOauthTokenInfo] =
+    useState<AntigravityOauthTokenInfo | null>(null);
+  const [antigravityOauthProfile, setAntigravityOauthProfile] =
+    useState<AntigravityOauthProfile | null>(null);
+  const [antigravityOpenAiModelOptions, setAntigravityOpenAiModelOptions] = useState<ModelOption[]>([]);
   const [openRouterApiKey, setOpenRouterApiKey] = useState(
     persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey,
   );
@@ -316,6 +330,8 @@ function App() {
   const queuedPromptsRef = useRef<string[]>([]);
   const [queuedPromptsVersion, setQueuedPromptsVersion] = useState(0);
   const suppressNextSubmitRef = useRef(false);
+  const previousAntigravityModelIdsRef = useRef<Set<string>>(new Set());
+  const skipNextAntigravitySyncTokenRef = useRef<string | null>(null);
   const suppressCtrlVEchoRef = useRef<{
     active: boolean;
     previousInput: string;
@@ -332,14 +348,48 @@ function App() {
     return id;
   };
 
-  const activeModelOptions = useMemo(
-    () => getModelOptionsForProviders(enabledProviders, modelOptionsByProvider),
-    [enabledProviders, modelOptionsByProvider],
+  const hasOpenAiToken = openAiAccessToken.trim().length > 0;
+  const hasOpenRouterKey = openRouterApiKey.trim().length > 0;
+  const antigravityAccessToken = (antigravityOauthTokenInfo?.accessToken ?? "").trim();
+  const hasAntigravityToken = antigravityAccessToken.length > 0;
+  const selectableModelProviders = useMemo(
+    () => getSelectableModelProviders(enabledProviders, hasAntigravityToken),
+    [enabledProviders, hasAntigravityToken],
   );
-
+  const activeModelOptions = useMemo(
+    () => getModelOptionsForProviders(selectableModelProviders, modelOptionsByProvider),
+    [selectableModelProviders, modelOptionsByProvider],
+  );
   const selectedModelProvider = useMemo(
     () => findProviderForModel(selectedModel, activeModelOptions) ?? null,
     [selectedModel, activeModelOptions],
+  );
+  const authSummary = useMemo(() => {
+    const connected = [...enabledProviders] as string[];
+    if (hasAntigravityToken) {
+      connected.push("antigravity");
+    }
+    return connected.length > 0 ? connected.join(", ") : "not selected";
+  }, [enabledProviders, hasAntigravityToken]);
+  const authOptions = useMemo(
+    () =>
+      buildAuthOptions({
+        hasOpenAi: hasOpenAiToken,
+        hasOpenRouter: hasOpenRouterKey,
+        hasAntigravity: hasAntigravityToken,
+        includeAntigravity: true,
+      }),
+    [hasAntigravityToken, hasOpenAiToken, hasOpenRouterKey],
+  );
+  const providerAuthOptions = useMemo(
+    () =>
+      buildAuthOptions({
+        hasOpenAi: hasOpenAiToken,
+        hasOpenRouter: hasOpenRouterKey,
+        hasAntigravity: hasAntigravityToken,
+        includeAntigravity: false,
+      }),
+    [hasAntigravityToken, hasOpenAiToken, hasOpenRouterKey],
   );
 
   const commandSuggestions = useMemo(() => {
@@ -370,6 +420,8 @@ function App() {
   );
   const showSkillSuggestions =
     input.startsWith("$") && skillSuggestions.length > 0 && !suppressSkillSuggestions;
+  const showCommandSuggestionPanel = commandSuggestions.length > 0 && !selector;
+  const showSkillSuggestionPanel = showSkillSuggestions && !selector;
 
   useEffect(() => {
     setCommandIndex((current) => {
@@ -413,18 +465,68 @@ function App() {
   }, []);
 
   useEffect(() => {
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        const runtimeSecrets = await loadPersistedRuntimeSecrets(persistedState);
+        if (cancelled) {
+          return;
+        }
+
+        if (runtimeSecrets.openRouterApiKey) {
+          setOpenRouterApiKey(runtimeSecrets.openRouterApiKey);
+          setEnabledProviders((current) => dedupeAuthProviders([...current, "openrouter"]));
+        }
+        if (runtimeSecrets.exaApiKey) {
+          setExaApiKey(runtimeSecrets.exaApiKey);
+        }
+
+        const openAiAuth = await loadPersistedOpenAiChatgptAuth();
+        if (!cancelled && openAiAuth?.accessToken.trim()) {
+          setOpenAiAccessToken(openAiAuth.accessToken);
+          setOpenAiAccountId(openAiAuth.accountId ?? null);
+          setEnabledProviders((current) => dedupeAuthProviders([...current, "openai"]));
+        }
+
+        const antigravityTokenInfo = await loadPersistedAntigravityOauthTokenInfo();
+        if (!cancelled && antigravityTokenInfo) {
+          setAntigravityOauthTokenInfo(antigravityTokenInfo);
+          const profile = await fetchAntigravityProfileData(antigravityTokenInfo.accessToken);
+          if (!cancelled) {
+            setAntigravityOauthProfile(profile);
+          }
+        }
+      } finally {
+        if (!cancelled) {
+          setSecretsHydrated(true);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [persistedState]);
+
+  useEffect(() => {
     configureBuiltinTools({
       exaApiKey,
     });
   }, [exaApiKey]);
 
   useEffect(() => {
+    void persistRuntimeSecrets({
+      openRouterApiKey,
+      exaApiKey,
+    });
+  }, [openRouterApiKey, exaApiKey]);
+
+  useEffect(() => {
     savePersistedState({
       authProviders: enabledProviders,
       selectedModel,
       selectedThinking,
-      openRouterApiKey,
-      exaApiKey,
       selectedOpenRouterProvider,
       onboardingCompleted,
       inputHistory,
@@ -433,12 +535,64 @@ function App() {
     enabledProviders,
     selectedModel,
     selectedThinking,
-    openRouterApiKey,
-    exaApiKey,
     selectedOpenRouterProvider,
     onboardingCompleted,
     inputHistory,
   ]);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    if (!antigravityAccessToken) {
+      setAntigravityOpenAiModelOptions([]);
+      skipNextAntigravitySyncTokenRef.current = null;
+      return;
+    }
+
+    if (skipNextAntigravitySyncTokenRef.current === antigravityAccessToken) {
+      skipNextAntigravitySyncTokenRef.current = null;
+      return;
+    }
+
+    void (async () => {
+      try {
+        const result = await discoverAntigravityModelOptions({
+          accessToken: antigravityAccessToken,
+        });
+        if (cancelled) {
+          return;
+        }
+
+        setAntigravityOpenAiModelOptions(toAntigravityOpenAiModelOptions(result.models));
+      } catch (error) {
+        if (!cancelled) {
+          setAntigravityOpenAiModelOptions([]);
+          const message = error instanceof Error ? error.message : String(error);
+          appendAntigravityModelSyncFailureMessages(appendSystemMessage, message);
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [antigravityAccessToken]);
+
+  useEffect(() => {
+    setModelOptionsByProvider((current) => {
+      const previousIds = previousAntigravityModelIdsRef.current;
+      const baseOpenAi = current.openai.filter((option) => !previousIds.has(option.id));
+      previousAntigravityModelIdsRef.current = new Set(antigravityOpenAiModelOptions.map((option) => option.id));
+
+      return {
+        ...current,
+        openai: mergeOpenAiAndAntigravityModels(
+          baseOpenAi.length > 0 ? baseOpenAi : getDefaultModelOptionsForProvider("openai"),
+          antigravityOpenAiModelOptions,
+        ),
+      };
+    });
+  }, [antigravityOpenAiModelOptions]);
 
   useEffect(() => {
     let cancelled = false;
@@ -459,7 +613,7 @@ function App() {
 
           setModelOptionsByProvider((current) => ({
             ...current,
-            openai: result.models,
+            openai: mergeOpenAiAndAntigravityModels(result.models, antigravityOpenAiModelOptions),
           }));
           continue;
         }
@@ -490,9 +644,9 @@ function App() {
 
   useEffect(() => {
     setSelectedModel((currentModel) =>
-      resolveModelForEnabledProviders(enabledProviders, currentModel, modelOptionsByProvider),
+      resolveModelForEnabledProviders(selectableModelProviders, currentModel, modelOptionsByProvider),
     );
-  }, [enabledProviders, modelOptionsByProvider]);
+  }, [selectableModelProviders, modelOptionsByProvider]);
 
   useEffect(() => {
     const provider = findProviderForModel(selectedModel, activeModelOptions);
@@ -619,6 +773,9 @@ function App() {
   };
 
   useEffect(() => {
+    if (!secretsHydrated) {
+      return;
+    }
     if (selector) {
       return;
     }
@@ -636,22 +793,30 @@ function App() {
         kind: "auth",
         title: "select auth provider",
         index: 0,
-        options: AUTH_OPTIONS,
+        options: providerAuthOptions,
       });
     }
-  }, [enabledProviders, exaApiKey, onboardingCompleted, selector]);
+  }, [enabledProviders, exaApiKey, onboardingCompleted, providerAuthOptions, secretsHydrated, selector]);
 
-  const openAuthSelector = (returnToOnboarding = false) => {
+  const openAuthSelector = (returnToOnboarding = false, providerOnly = false) => {
+    const options = returnToOnboarding || providerOnly ? providerAuthOptions : authOptions;
     setInput("");
-    const firstMissing = AUTH_OPTIONS.find((option) => !enabledProviders.includes(option.id));
+    const firstMissing = options.find(
+      (option) =>
+        !isAuthSelectionConfigured(option.id, {
+          hasOpenAi: hasOpenAiToken,
+          hasOpenRouter: hasOpenRouterKey,
+          hasAntigravity: hasAntigravityToken,
+        }),
+    );
     const defaultIndex = firstMissing
-      ? AUTH_OPTIONS.findIndex((option) => option.id === firstMissing.id)
+      ? options.findIndex((option) => option.id === firstMissing.id)
       : 0;
     setSelector({
       kind: "auth",
       title: "add auth provider",
       index: defaultIndex,
-      options: AUTH_OPTIONS,
+      options,
       returnToOnboarding,
     });
   };
@@ -665,11 +830,50 @@ function App() {
     });
   };
 
-  const applyAuthProviderSelection = async (
-    provider: AuthProvider,
+  const applyAuthSelection = async (
+    selection: AuthSelection,
     openRouterKeyOverride?: string,
     returnToOnboarding = false,
   ): Promise<boolean> => {
+    if (selection === "antigravity") {
+      setPending(true);
+      setStatusLabel("starting antigravity oauth...");
+      appendSystemMessage(
+        hasAntigravityToken ? "restarting antigravity oauth login..." : "starting antigravity oauth login...",
+      );
+      try {
+        const loginResult = await runAntigravityOauthLogin();
+        const accessToken = loginResult.tokenInfo.accessToken.trim();
+        setStatusLabel("syncing antigravity models...");
+        if (accessToken) {
+          try {
+            const result = await discoverAntigravityModelOptions({
+              accessToken,
+            });
+            setAntigravityOpenAiModelOptions(toAntigravityOpenAiModelOptions(result.models));
+            skipNextAntigravitySyncTokenRef.current = accessToken;
+          } catch (error) {
+            setAntigravityOpenAiModelOptions([]);
+            skipNextAntigravitySyncTokenRef.current = accessToken;
+            const message = error instanceof Error ? error.message : String(error);
+            appendAntigravityModelSyncFailureMessages(appendSystemMessage, message);
+          }
+        }
+        setAntigravityOauthTokenInfo(loginResult.tokenInfo);
+        setAntigravityOauthProfile(loginResult.profile);
+        appendSystemMessage("antigravity oauth login complete.");
+        return true;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`antigravity oauth login failed: ${message}`);
+        return false;
+      } finally {
+        setPending(false);
+        setStatusLabel("ready");
+      }
+    }
+
+    const provider = selection;
     if (provider === "openrouter") {
       const key = (openRouterKeyOverride ?? openRouterApiKey).trim();
       if (!key) {
@@ -703,13 +907,12 @@ function App() {
         return true;
       }
     } else {
-      if (enabledProviders.includes(provider)) {
+      let accessToken = openAiAccessToken.trim();
+      let accountId = openAiAccountId?.trim() || null;
+      if (enabledProviders.includes(provider) && accessToken) {
         appendSystemMessage(`${provider} auth already enabled.`);
         return true;
       }
-
-      let accessToken = openAiAccessToken.trim();
-      let accountId = openAiAccountId?.trim() || null;
       if (!accessToken) {
         setPending(true);
         setStatusLabel("starting oauth login...");
@@ -793,13 +996,13 @@ function App() {
       openOnboardingSelector();
       return;
     }
-    if (enabledProviders.length === 0) {
-      openAuthSelector(false);
+    if (selectableModelProviders.length === 0) {
+      openAuthSelector(false, true);
       return;
     }
 
     setInput("");
-    const modelOptions = getModelOptionsForProviders(enabledProviders, modelOptionsByProvider);
+    const modelOptions = getModelOptionsForProviders(selectableModelProviders, modelOptionsByProvider);
     const selectedIndex = Math.max(
       0,
       modelOptions.findIndex((option) => option.id === selectedModel),
@@ -863,8 +1066,7 @@ function App() {
     >,
     index: number,
   ) => {
-    const WINDOW_SIZE = 10;
-    if (options.length <= WINDOW_SIZE) {
+    if (options.length <= SELECTOR_WINDOW_SIZE) {
       return {
         startIndex: 0,
         activeIndex: Math.max(0, Math.min(index, Math.max(0, options.length - 1))),
@@ -873,13 +1075,13 @@ function App() {
     }
 
     const activeIndex = Math.max(0, Math.min(index, options.length - 1));
-    const halfWindow = Math.floor(WINDOW_SIZE / 2);
-    const maxStart = Math.max(0, options.length - WINDOW_SIZE);
+    const halfWindow = Math.floor(SELECTOR_WINDOW_SIZE / 2);
+    const maxStart = Math.max(0, options.length - SELECTOR_WINDOW_SIZE);
     const startIndex = Math.max(0, Math.min(activeIndex - halfWindow, maxStart));
     return {
       startIndex,
       activeIndex,
-      options: options.slice(startIndex, startIndex + WINDOW_SIZE),
+      options: options.slice(startIndex, startIndex + SELECTOR_WINDOW_SIZE),
     };
   };
 
@@ -947,8 +1149,10 @@ function App() {
       params.modelProvider === "openrouter"
         ? ` | provider ${params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID}`
         : "";
+    const selectedOption = findModelOption(params.modelProvider, params.modelId, modelOptionsByProvider);
+    const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
     appendSystemMessage(
-      `model updated: ${params.modelLabel} (${params.thinkingLevel.toLowerCase()})${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
+      `model updated: ${params.modelLabel}${isAntigravityModel ? "" : ` (${params.thinkingLevel.toLowerCase()})`}${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
     );
     setInput("");
     setSelector(null);
@@ -1021,7 +1225,12 @@ function App() {
       `resumed chat ${session.id.slice(0, 8)} (${session.provider}, ${session.messageCount} msgs).`,
     );
 
-    if (session.provider === "openai" && !openAiAccessToken.trim()) {
+    const resumedOption = findModelOption(session.provider, session.model, modelOptionsByProvider);
+    const isResumedAntigravityModel =
+      (resumedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity" ||
+      antigravityOpenAiModelOptions.some((option) => option.id === session.model);
+
+    if (session.provider === "openai" && !isResumedAntigravityModel && !openAiAccessToken.trim()) {
       appendSystemMessage("this chat uses openai. run /auth before sending the next prompt.");
     }
     if (session.provider === "openrouter" && !openRouterApiKey.trim()) {
@@ -1068,7 +1277,7 @@ function App() {
     const args = tokens.slice(1);
 
     if (command === "/auth") {
-      openAuthSelector(false);
+      openAuthSelector(false, false);
       return;
     }
 
@@ -1082,6 +1291,8 @@ function App() {
       setEnabledProviders([]);
       setOpenAiAccessToken("");
       setOpenAiAccountId(null);
+      setAntigravityOauthTokenInfo(null);
+      setAntigravityOauthProfile(null);
       setOpenRouterApiKey("");
       setExaApiKey("");
       setSelectedOpenRouterProvider(OPENROUTER_PROVIDER_ANY_ID);
@@ -1324,7 +1535,11 @@ function App() {
           openOnboardingSelector();
           return;
         }
-        if (selector.kind === "auth" && enabledProviders.length === 0) {
+        if (
+          selector.kind === "auth" &&
+          enabledProviders.length === 0 &&
+          selector.options.every((option) => option.id !== "antigravity")
+        ) {
           return;
         }
         setInput("");
@@ -1374,11 +1589,11 @@ function App() {
             return;
           }
           if (onboardingChoice.id === "auth_openai") {
-            openAuthSelector(true);
+            openAuthSelector(true, true);
             return;
           }
           if (onboardingChoice.id === "auth_openrouter") {
-            openAuthSelector(true);
+            openAuthSelector(true, true);
             return;
           }
           openExaApiKeySelector(true);
@@ -1415,7 +1630,7 @@ function App() {
             return;
           }
           void (async () => {
-            const ok = await applyAuthProviderSelection(
+            const ok = await applyAuthSelection(
               "openrouter",
               keyInput,
               selector.returnToOnboarding === true,
@@ -1439,7 +1654,7 @@ function App() {
             return;
           }
           void (async () => {
-            const ok = await applyAuthProviderSelection(
+            const ok = await applyAuthSelection(
               authChoice.id,
               undefined,
               selector.returnToOnboarding === true,
@@ -1498,6 +1713,8 @@ function App() {
             appendSystemMessage("no model matches your search.");
             return;
           }
+          const isAntigravityModel =
+            (modelChoice.displayProvider ?? "").trim().toLowerCase() === "antigravity";
           const thinkingOptions = getThinkingOptionsForModel(
             modelChoice.id,
             modelChoice.provider,
@@ -1513,6 +1730,20 @@ function App() {
             0,
             thinkingOptions.findIndex((option) => option.id === defaultThinking),
           );
+
+          if (isAntigravityModel) {
+            const antigravityThinking =
+              modelChoice.defaultThinkingLevel ??
+              (thinkingOptions[defaultIndex]?.id as ThinkingLevel | undefined) ??
+              "MEDIUM";
+            applyModelSelection({
+              modelId: modelChoice.id,
+              modelLabel: modelChoice.label,
+              modelProvider: modelChoice.provider,
+              thinkingLevel: antigravityThinking,
+            });
+            return;
+          }
 
           setSelector({
             kind: "thinking",
@@ -1671,7 +1902,46 @@ function App() {
     }
   });
 
-  const visibleMessages = useMemo(() => messages.slice(-MAX_VISIBLE_MESSAGES), [messages]);
+  const visibleMessageLimit = useMemo(() => {
+    const terminalRows = Number.isFinite(process.stdout.rows) ? process.stdout.rows : 24;
+    let reservedRows = BASE_LAYOUT_ROWS + (pending ? 1 : 0);
+
+    if (showCommandSuggestionPanel) {
+      reservedRows += commandSuggestions.length + 2;
+    }
+
+    if (showSkillSuggestionPanel) {
+      reservedRows += skillSuggestions.length + 2;
+    }
+
+    if (selector) {
+      if (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") {
+        reservedRows += 3;
+      } else {
+        const allOptions = getSelectorAllOptions(selector);
+        const windowed = getSelectorOptionWindow(allOptions, selector.index);
+        const hasWindowHint = allOptions.length > windowed.options.length;
+        reservedRows += windowed.options.length + (hasWindowHint ? 1 : 0) + 3;
+      }
+    }
+
+    const availableRows = Math.max(0, terminalRows - reservedRows);
+    const maxMessagesByRows = Math.floor(availableRows / MIN_VISIBLE_MESSAGE_ROWS);
+    return Math.max(1, Math.min(MAX_VISIBLE_MESSAGES, maxMessagesByRows));
+  }, [
+    pending,
+    showCommandSuggestionPanel,
+    showSkillSuggestionPanel,
+    commandSuggestions.length,
+    skillSuggestions.length,
+    selector,
+    input,
+  ]);
+
+  const visibleMessages = useMemo(
+    () => messages.slice(-visibleMessageLimit),
+    [messages, visibleMessageLimit],
+  );
 
   const sendPrompt = async (prompt: string) => {
     const cleanPrompt = prompt.trim();
@@ -1688,22 +1958,33 @@ function App() {
     const provider = selectedModelProvider;
     if (!provider) {
       appendSystemMessage("select a model from an enabled provider first.");
-      openAuthSelector(false);
+      openAuthSelector(false, true);
       return;
     }
-    if (!enabledProviders.includes(provider)) {
+    const selectedOption = findModelOption(provider, selectedModel, modelOptionsByProvider);
+    const isAntigravityModel =
+      (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+
+    const hasProviderAccess =
+      enabledProviders.includes(provider) || (isAntigravityModel && provider === "openai");
+    if (!hasProviderAccess) {
       appendSystemMessage(`provider ${provider} is not enabled. run /auth to add it.`);
-      openAuthSelector(false);
+      openAuthSelector(false, true);
       return;
     }
-    if (provider === "openai" && !openAiAccessToken.trim()) {
+    if (isAntigravityModel && !antigravityAccessToken) {
+      appendSystemMessage("antigravity model selected, but no antigravity oauth token is available. run /auth.");
+      openAuthSelector(false, true);
+      return;
+    }
+    if (!isAntigravityModel && provider === "openai" && !openAiAccessToken.trim()) {
       appendSystemMessage("openai model selected, but no chatgpt oauth token is available. run /auth.");
-      openAuthSelector(false);
+      openAuthSelector(false, true);
       return;
     }
     if (provider === "openrouter" && !openRouterApiKey.trim()) {
       appendSystemMessage("openrouter model selected, but no openrouter api key is available. run /auth.");
-      openAuthSelector(false);
+      openAuthSelector(false, true);
       return;
     }
     const skillCatalog = refreshSkillsCatalog();
@@ -1745,7 +2026,7 @@ function App() {
     }
 
     const normalizedOpenRouterProvider =
-      provider === "openrouter"
+      !isAntigravityModel && provider === "openrouter"
         ? normalizeOpenRouterProviderSelection(selectedOpenRouterProvider)
         : undefined;
     const needsNewSession =
@@ -1848,7 +2129,22 @@ function App() {
       });
 
       const result =
-        provider === "openrouter"
+        isAntigravityModel
+          ? await runAntigravityInferenceStream(
+              {
+                accessToken: antigravityAccessToken,
+                model: selectedModel,
+                messages: modelHistory,
+                thinkingLevel: selectedThinking,
+                includeThoughts: selectedThinking !== "OFF",
+                systemInstruction: runtimeSystemInstruction,
+                signal: inferenceAbortController.signal,
+                drainSteeringMessages,
+              },
+              handleChunk,
+              handleDebug,
+            )
+          : provider === "openrouter"
           ? await runOpenRouterInferenceStream(
               {
                 apiKey: openRouterApiKey,
@@ -2005,7 +2301,7 @@ function App() {
     <Box flexDirection="column" paddingX={1}>
       <Text color="cyanBright">loaf | beta</Text>
       <Text color="gray">
-        auth: {enabledProviders.length > 0 ? enabledProviders.join(", ") : "not selected"} |{" "}
+        auth: {authSummary} |{" "}
         model:{" "}
         {selectedModelProvider
           ? formatModelSummary(
@@ -2020,7 +2316,7 @@ function App() {
       <Newline />
       <Box flexDirection="column">
         {visibleMessages.map((message) => (
-          <MessageRow key={message.id} message={message} />
+          <MemoizedMessageRow key={message.id} message={message} />
         ))}
       </Box>
       {selector && (
@@ -2044,7 +2340,7 @@ function App() {
                       const selected = absoluteIndex === windowed.activeIndex;
                       return (
                         <Text key={`${selector.kind}-${option.id}`} color={selected ? "magentaBright" : "gray"}>
-                          {selected ? ">" : " "} {option.label} - {selector.kind === "model" ? (option as ModelOption).provider : option.description}
+                          {selected ? ">" : " "} {option.label} - {selector.kind === "model" ? getModelProviderDisplayLabel(option as ModelOption) : option.description}
                         </Text>
                       );
                     })}
@@ -2069,7 +2365,7 @@ function App() {
       )}
       <Newline />
       {pending && <Text color="yellow">{GLYPH_SYSTEM}{statusLabel}</Text>}
-      {commandSuggestions.length > 0 && !selector && (
+      {showCommandSuggestionPanel && (
         <Box flexDirection="column" marginTop={1}>
           {commandSuggestions.map((suggestion, index) => (
             <Text key={suggestion.name} color={index === commandIndex ? "magentaBright" : "gray"}>
@@ -2079,7 +2375,7 @@ function App() {
           <Text color="gray">tab autocomplete | up/down navigate suggestions</Text>
         </Box>
       )}
-      {showSkillSuggestions && !selector && (
+      {showSkillSuggestionPanel && (
         <Box flexDirection="column" marginTop={1}>
           {skillSuggestions.map((skill, index) => (
             <Text key={skill.name} color={index === skillIndex ? "magentaBright" : "gray"}>
@@ -2777,16 +3073,18 @@ function MessageRow({ message }: { message: UiMessage }) {
   if (message.kind === "assistant") {
     return (
       <Box flexDirection="column" marginBottom={1}>
-        <MarkdownText text={message.text} prefix={GLYPH_ASSISTANT} />
+        <MemoizedMarkdownText text={message.text} prefix={GLYPH_ASSISTANT} />
       </Box>
     );
   }
   return (
     <Box flexDirection="column" marginBottom={1}>
-      <MarkdownText text={message.text} prefix={GLYPH_SYSTEM} />
+      <MemoizedMarkdownText text={message.text} prefix={GLYPH_SYSTEM} />
     </Box>
   );
 }
+
+const MemoizedMessageRow = React.memo(MessageRow);
 
 function chatHistoryToUiMessages(history: ChatMessage[], nextMessageId: () => number): UiMessage[] {
   return history.map((message) => ({
@@ -3214,6 +3512,124 @@ function parseThoughtTitle(rawThought: string): string {
   return (firstLine || "reasoning").toLowerCase();
 }
 
+function appendAntigravityModelSyncFailureMessages(
+  appendSystemMessage: (text: string) => void,
+  rawMessage: string,
+): void {
+  const message = rawMessage.trim() || "unknown error";
+  const cloudCodeStatus = extractCloudCodeStatus(message);
+  const enableApiUrl = extractGoogleApiEnableUrl(message);
+  const projectId = extractGoogleProjectId(message, enableApiUrl);
+
+  if (isAntigravityApiDisabledError(message)) {
+    const projectSuffix = projectId ? ` for project ${projectId}` : "";
+    appendSystemMessage(`antigravity model sync blocked: cloud code api is disabled${projectSuffix}.`);
+    if (enableApiUrl) {
+      appendSystemMessage(`enable antigravity cloud code api: ${enableApiUrl}`);
+    }
+    return;
+  }
+
+  if (cloudCodeStatus) {
+    appendSystemMessage(`antigravity model sync failed (cloudcode ${cloudCodeStatus}).`);
+    return;
+  }
+
+  const compact = message.replace(/\s+/g, " ").trim();
+  appendSystemMessage(`antigravity model sync failed: ${clipInline(compact, 180)}`);
+}
+
+function isAntigravityApiDisabledError(message: string): boolean {
+  const normalized = message.toLowerCase();
+  return (
+    normalized.includes("cloud code private api") &&
+    (normalized.includes("has not been used in project") || normalized.includes("is disabled"))
+  );
+}
+
+function extractGoogleApiEnableUrl(message: string): string | null {
+  const compact = message.replace(/\s+/g, " ").trim();
+  const match = compact.match(/https:\/\/console\.developers\.google\.com\/apis\/api\/[^\s"'`<>)]+/i);
+  if (!match) {
+    return null;
+  }
+  return match[0].replace(/[.,;:!?]+$/g, "");
+}
+
+function extractGoogleProjectId(message: string, enableApiUrl: string | null): string | null {
+  if (enableApiUrl) {
+    try {
+      const parsed = new URL(enableApiUrl);
+      const project = parsed.searchParams.get("project")?.trim();
+      if (project) {
+        return project;
+      }
+    } catch {
+      // ignore malformed URLs
+    }
+  }
+
+  const projectMatch = message.match(/projects\/([a-z0-9-]+)/i);
+  return projectMatch?.[1]?.trim() || null;
+}
+
+function extractCloudCodeStatus(message: string): string | null {
+  const match = message.match(/\[cloudcode\s+(\d{3})\]/i);
+  return match?.[1] ?? null;
+}
+
+function toAntigravityOpenAiModelOptions(models: AntigravityDiscoveredModel[]): ModelOption[] {
+  const options: ModelOption[] = [];
+  for (const model of models) {
+    const id = model.id.trim();
+    if (!id) {
+      continue;
+    }
+    const thinking = antigravityModelToThinkingLevels(model);
+    options.push({
+      id,
+      provider: "openai",
+      displayProvider: "antigravity",
+      label: model.label.trim() || modelIdToLabel(id),
+      description: model.description.trim() || "antigravity catalog model",
+      supportedThinkingLevels: thinking.supportedThinkingLevels,
+      defaultThinkingLevel: thinking.defaultThinkingLevel,
+    });
+  }
+  return options;
+}
+
+function mergeOpenAiAndAntigravityModels(baseOpenAi: ModelOption[], antigravityOpenAi: ModelOption[]): ModelOption[] {
+  if (antigravityOpenAi.length === 0) {
+    return baseOpenAi;
+  }
+
+  const merged = new Map<string, ModelOption>();
+  for (const option of baseOpenAi) {
+    merged.set(option.id, option);
+  }
+
+  for (const option of antigravityOpenAi) {
+    const existing = merged.get(option.id);
+    if (!existing) {
+      merged.set(option.id, option);
+      continue;
+    }
+
+    merged.set(option.id, {
+      ...existing,
+      displayProvider: existing.displayProvider ?? option.displayProvider,
+      supportedThinkingLevels:
+        existing.supportedThinkingLevels && existing.supportedThinkingLevels.length > 0
+          ? existing.supportedThinkingLevels
+          : option.supportedThinkingLevels,
+      defaultThinkingLevel: existing.defaultThinkingLevel ?? option.defaultThinkingLevel,
+    });
+  }
+
+  return Array.from(merged.values());
+}
+
 function resolveInitialOnboardingCompleted(persistedState: LoafPersistedState | null): boolean {
   if (!persistedState) {
     return false;
@@ -3225,6 +3641,53 @@ function resolveInitialOnboardingCompleted(persistedState: LoafPersistedState | 
     return false;
   }
   return true;
+}
+
+function buildAuthOptions(params: {
+  hasOpenAi: boolean;
+  hasOpenRouter: boolean;
+  hasAntigravity: boolean;
+  includeAntigravity: boolean;
+}): AuthOption[] {
+  const options: AuthOption[] = [
+    {
+      id: "openai",
+      label: params.hasOpenAi ? "openai oauth (connected)" : "openai oauth",
+      description: "chatgpt account login (codex auth flow)",
+    },
+    {
+      id: "openrouter",
+      label: params.hasOpenRouter ? "openrouter api key (configured)" : "openrouter api key",
+      description: "enter your openrouter key in /auth",
+    },
+  ];
+
+  if (params.includeAntigravity) {
+    options.splice(1, 0, {
+      id: "antigravity",
+      label: params.hasAntigravity ? "antigravity oauth (connected)" : "antigravity oauth",
+      description: "real antigravity oauth flow (google cloud scopes)",
+    });
+  }
+
+  return options;
+}
+
+function isAuthSelectionConfigured(
+  selection: AuthSelection,
+  params: {
+    hasOpenAi: boolean;
+    hasOpenRouter: boolean;
+    hasAntigravity: boolean;
+  },
+): boolean {
+  if (selection === "openai") {
+    return params.hasOpenAi;
+  }
+  if (selection === "openrouter") {
+    return params.hasOpenRouter;
+  }
+  return params.hasAntigravity;
 }
 
 function buildOnboardingAuthOptions(enabledProviders: AuthProvider[]): OnboardingOption[] {
@@ -3291,6 +3754,13 @@ function resolveInitialModel(
   return resolveModelForEnabledProviders(providers, candidate, modelOptionsByProvider);
 }
 
+function getSelectableModelProviders(enabledProviders: AuthProvider[], hasAntigravityToken: boolean): AuthProvider[] {
+  if (!hasAntigravityToken) {
+    return enabledProviders;
+  }
+  return dedupeAuthProviders([...enabledProviders, "openai"]);
+}
+
 function resolveModelForEnabledProviders(
   providers: AuthProvider[],
   candidate: string | undefined,
@@ -3353,9 +3823,7 @@ function getModelOptionsForProviders(
   providers: AuthProvider[],
   modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
 ): ModelOption[] {
-  const orderedProviders = AUTH_OPTIONS
-    .map((option) => option.id)
-    .filter((provider) => providers.includes(provider));
+  const orderedProviders = AUTH_PROVIDER_ORDER.filter((provider) => providers.includes(provider));
 
   const combined: ModelOption[] = [];
   for (const provider of orderedProviders) {
@@ -3473,12 +3941,18 @@ function formatModelSummary(
   modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
   openRouterProvider: string,
 ): string {
+  const providerLabel = getModelProviderDisplayLabelForModel(provider, modelId, modelOptionsByProvider);
   const options = getModelOptionsForProvider(provider, modelOptionsByProvider);
-  const label = options.find((option) => option.id === modelId)?.label || modelIdToLabel(modelId);
-  if (provider === "openrouter") {
-    return `${provider} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()}, provider: ${normalizeOpenRouterProviderSelection(openRouterProvider)})`;
+  const selectedOption = options.find((option) => option.id === modelId);
+  const label = selectedOption?.label || modelIdToLabel(modelId);
+  const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+  if (isAntigravityModel) {
+    return `${providerLabel} - ${label.toLowerCase()}`;
   }
-  return `${provider} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()})`;
+  if (provider === "openrouter") {
+    return `${providerLabel} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()}, provider: ${normalizeOpenRouterProviderSelection(openRouterProvider)})`;
+  }
+  return `${providerLabel} - ${label.toLowerCase()} (${thinkingLevel.toLowerCase()})`;
 }
 
 function findModelOption(
@@ -3487,6 +3961,26 @@ function findModelOption(
   modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
 ): ModelOption | undefined {
   return getModelOptionsForProvider(provider, modelOptionsByProvider).find((option) => option.id === modelId);
+}
+
+function getModelProviderDisplayLabel(option: ModelOption): string {
+  const display = (option.displayProvider ?? "").trim().toLowerCase();
+  if (display) {
+    return display;
+  }
+  return option.provider;
+}
+
+function getModelProviderDisplayLabelForModel(
+  provider: AuthProvider,
+  modelId: string,
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>,
+): string {
+  const option = findModelOption(provider, modelId, modelOptionsByProvider);
+  if (option) {
+    return getModelProviderDisplayLabel(option);
+  }
+  return provider;
 }
 
 function normalizeOpenRouterProviderSelection(value: string | undefined | null): string {
@@ -3635,6 +4129,8 @@ function MarkdownText({ text, prefix = "" }: { text: string; prefix?: string }) 
     </Box>
   );
 }
+
+const MemoizedMarkdownText = React.memo(MarkdownText);
 
 function renderInlineMarkdown(input: string, keyPrefix: string): React.ReactNode[] {
   const text = normalizeInlineMarkdown(input);

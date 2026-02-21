@@ -2,6 +2,17 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { type AuthProvider, type ThinkingLevel } from "./config.js";
+import {
+  SECRET_ACCOUNT_ANTIGRAVITY_OAUTH_TOKEN_INFO,
+  SECRET_ACCOUNT_EXA_API_KEY,
+  SECRET_ACCOUNT_OPENAI_CHATGPT_AUTH,
+  SECRET_ACCOUNT_OPENROUTER_API_KEY,
+} from "./secret-accounts.js";
+import {
+  deleteSecureValue,
+  getSecureValue,
+  setSecureValue,
+} from "./secure-store.js";
 
 export type LoafPersistedState = {
   version: 1;
@@ -9,12 +20,18 @@ export type LoafPersistedState = {
   authProvider?: AuthProvider;
   selectedModel?: string;
   selectedThinking?: ThinkingLevel;
+  // Legacy plaintext secret fields. Kept for migration only.
   openRouterApiKey?: string;
   exaApiKey?: string;
   selectedOpenRouterProvider?: string;
   onboardingCompleted?: boolean;
   inputHistory?: string[];
   updatedAt?: string;
+};
+
+export type LoafRuntimeSecrets = {
+  openRouterApiKey: string;
+  exaApiKey: string;
 };
 
 const CURRENT_LOAF_DATA_DIR = path.join(os.homedir(), ".loaf");
@@ -50,8 +67,6 @@ export function savePersistedState(next: {
   authProviders: AuthProvider[];
   selectedModel: string;
   selectedThinking: ThinkingLevel;
-  openRouterApiKey?: string;
-  exaApiKey?: string;
   selectedOpenRouterProvider?: string;
   onboardingCompleted: boolean;
   inputHistory: string[];
@@ -65,14 +80,6 @@ export function savePersistedState(next: {
     authProvider: primaryAuthProvider,
     selectedModel: next.selectedModel.trim(),
     selectedThinking: next.selectedThinking,
-    openRouterApiKey:
-      typeof next.openRouterApiKey === "string" && next.openRouterApiKey.trim()
-        ? next.openRouterApiKey.trim()
-        : undefined,
-    exaApiKey:
-      typeof next.exaApiKey === "string" && next.exaApiKey.trim()
-        ? next.exaApiKey.trim()
-        : undefined,
     selectedOpenRouterProvider:
       typeof next.selectedOpenRouterProvider === "string" && next.selectedOpenRouterProvider.trim()
         ? next.selectedOpenRouterProvider.trim()
@@ -239,6 +246,61 @@ export function clearPersistedConfig(): void {
   } catch {
     // best-effort cleanup
   }
+
+  void clearPersistedSecrets();
+}
+
+export async function loadPersistedRuntimeSecrets(
+  legacyState: LoafPersistedState | null,
+): Promise<LoafRuntimeSecrets> {
+  const legacyOpenRouterApiKey = legacyState?.openRouterApiKey?.trim() ?? "";
+  const legacyExaApiKey = legacyState?.exaApiKey?.trim() ?? "";
+
+  let openRouterApiKey = await getSecureValue(SECRET_ACCOUNT_OPENROUTER_API_KEY);
+  let exaApiKey = await getSecureValue(SECRET_ACCOUNT_EXA_API_KEY);
+
+  if (!openRouterApiKey && legacyOpenRouterApiKey) {
+    const stored = await setSecureValue(SECRET_ACCOUNT_OPENROUTER_API_KEY, legacyOpenRouterApiKey);
+    if (stored) {
+      openRouterApiKey = legacyOpenRouterApiKey;
+    }
+  }
+  if (!exaApiKey && legacyExaApiKey) {
+    const stored = await setSecureValue(SECRET_ACCOUNT_EXA_API_KEY, legacyExaApiKey);
+    if (stored) {
+      exaApiKey = legacyExaApiKey;
+    }
+  }
+
+  const canScrubOpenRouter = !legacyOpenRouterApiKey || Boolean(openRouterApiKey);
+  const canScrubExa = !legacyExaApiKey || Boolean(exaApiKey);
+  if (canScrubOpenRouter && canScrubExa && (legacyOpenRouterApiKey || legacyExaApiKey)) {
+    scrubLegacySecretsFromStateFiles();
+  }
+
+  return {
+    openRouterApiKey,
+    exaApiKey,
+  };
+}
+
+export async function persistRuntimeSecrets(next: LoafRuntimeSecrets): Promise<void> {
+  const openRouterApiKey = next.openRouterApiKey.trim();
+  const exaApiKey = next.exaApiKey.trim();
+
+  if (openRouterApiKey) {
+    await setSecureValue(SECRET_ACCOUNT_OPENROUTER_API_KEY, openRouterApiKey);
+  } else {
+    await deleteSecureValue(SECRET_ACCOUNT_OPENROUTER_API_KEY);
+  }
+
+  if (exaApiKey) {
+    await setSecureValue(SECRET_ACCOUNT_EXA_API_KEY, exaApiKey);
+  } else {
+    await deleteSecureValue(SECRET_ACCOUNT_EXA_API_KEY);
+  }
+
+  scrubLegacySecretsFromStateFiles();
 }
 
 function getLegacyStateBaseDir(): string {
@@ -302,4 +364,35 @@ function ensureLoafDataDirMigration(): void {
   } catch {
     // best-effort migration
   }
+}
+
+function scrubLegacySecretsFromStateFiles(): void {
+  scrubLegacySecretsFromStateFile(STATE_FILE_PATH);
+  scrubLegacySecretsFromStateFile(LEGACY_STATE_FILE_PATH);
+}
+
+function scrubLegacySecretsFromStateFile(stateFilePath: string): void {
+  const state = readStateFromPath(stateFilePath);
+  if (!state) {
+    return;
+  }
+  if (!state.openRouterApiKey && !state.exaApiKey) {
+    return;
+  }
+
+  const sanitized: LoafPersistedState = {
+    ...state,
+    openRouterApiKey: undefined,
+    exaApiKey: undefined,
+  };
+  writeStateToPath(stateFilePath, sanitized);
+}
+
+async function clearPersistedSecrets(): Promise<void> {
+  await Promise.all([
+    deleteSecureValue(SECRET_ACCOUNT_ANTIGRAVITY_OAUTH_TOKEN_INFO),
+    deleteSecureValue(SECRET_ACCOUNT_OPENROUTER_API_KEY),
+    deleteSecureValue(SECRET_ACCOUNT_EXA_API_KEY),
+    deleteSecureValue(SECRET_ACCOUNT_OPENAI_CHATGPT_AUTH),
+  ]);
 }

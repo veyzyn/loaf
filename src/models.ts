@@ -8,6 +8,7 @@ import { getLoafDataDir } from "./persistence.js";
 export type ModelOption = {
   id: string;
   provider: AuthProvider;
+  displayProvider?: string;
   label: string;
   description: string;
   supportedThinkingLevels?: ThinkingLevel[];
@@ -70,16 +71,6 @@ const DEFAULT_OPENAI_MODEL_OPTIONS: ModelOption[] = [
 ];
 
 const DEFAULT_OPENROUTER_MODEL_OPTIONS: ModelOption[] = [];
-
-const OPENAI_LABEL_OVERRIDES: Record<string, string> = {
-  "gpt-4.1": "gpt 4.1",
-  "gpt-4.1-mini": "gpt 4.1 mini",
-};
-
-const OPENAI_DESCRIPTION_OVERRIDES: Record<string, string> = {
-  "gpt-4.1": "stronger reasoning and coding quality",
-  "gpt-4.1-mini": "faster responses with lower latency",
-};
 
 export function getDefaultModelOptionsForProvider(provider: AuthProvider): ModelOption[] {
   const defaults = provider === "openai" ? DEFAULT_OPENAI_MODEL_OPTIONS : DEFAULT_OPENROUTER_MODEL_OPTIONS;
@@ -207,9 +198,8 @@ function normalizeOpenAiModelOptions(catalog: OpenAiCatalogModel[]): ModelOption
     byId.set(id, {
       id,
       provider: "openai",
-      label: OPENAI_LABEL_OVERRIDES[slug] || item.label.trim() || modelIdToLabel(id),
-      description:
-        OPENAI_DESCRIPTION_OVERRIDES[slug] || item.description.trim() || "server-advertised openai model",
+      label: item.label.trim() || modelIdToLabel(id),
+      description: item.description.trim() || "server-advertised openai model",
       supportedThinkingLevels,
       defaultThinkingLevel,
     });
