@@ -112,6 +112,8 @@ function readStateFromPath(stateFilePath: string): LoafPersistedState | null {
     const authProvider =
       parsed.authProvider === "openai"
         ? "openai"
+        : parsed.authProvider === "antigravity"
+          ? "antigravity"
         : parsed.authProvider === "openrouter" || parsed.authProvider === "vertex"
           ? "openrouter"
           : undefined;
@@ -122,7 +124,10 @@ function readStateFromPath(stateFilePath: string): LoafPersistedState | null {
       parsedProviders.length > 0
         ? parsedProviders
             .map((provider) => (provider === "vertex" ? "openrouter" : provider))
-            .filter((provider): provider is AuthProvider => provider === "openai" || provider === "openrouter")
+            .filter(
+              (provider): provider is AuthProvider =>
+                provider === "openai" || provider === "openrouter" || provider === "antigravity",
+            )
         : authProvider
           ? [authProvider]
           : [],
@@ -175,7 +180,10 @@ function readStateFromPath(stateFilePath: string): LoafPersistedState | null {
 function dedupeAuthProviders(providers: AuthProvider[]): AuthProvider[] {
   const ordered: AuthProvider[] = [];
   for (const provider of providers) {
-    if ((provider !== "openai" && provider !== "openrouter") || ordered.includes(provider)) {
+    if (
+      (provider !== "openai" && provider !== "openrouter" && provider !== "antigravity") ||
+      ordered.includes(provider)
+    ) {
       continue;
     }
     ordered.push(provider);

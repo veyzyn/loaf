@@ -21,6 +21,7 @@ export type OpenRouterModelCandidate = {
   description: string;
   supportedParameters: string[];
   providerTags: string[];
+  contextWindowTokens?: number;
 };
 
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
@@ -513,10 +514,47 @@ function parseOpenRouterModels(
       description: readTrimmedString(item.description) || "server-advertised openrouter model",
       supportedParameters,
       providerTags: modelProviders,
+      contextWindowTokens: parseContextWindowTokens(item),
     });
   }
 
   return Array.from(byId.values()).sort((a, b) => a.label.localeCompare(b.label));
+}
+
+function parseContextWindowTokens(model: Record<string, unknown>): number | undefined {
+  const directCandidates = [
+    model.context_length,
+    model.context_window,
+    model.max_context_tokens,
+    model.max_input_tokens,
+    model.contextLength,
+    model.contextWindow,
+  ];
+
+  for (const candidate of directCandidates) {
+    const parsed = parsePositiveInteger(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const architecture = readRecord(model.architecture);
+  if (architecture) {
+    const architectureCandidates = [
+      architecture.context_length,
+      architecture.context_window,
+      architecture.max_context_tokens,
+      architecture.max_input_tokens,
+    ];
+    for (const candidate of architectureCandidates) {
+      const parsed = parsePositiveInteger(candidate);
+      if (parsed) {
+        return parsed;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function extractProviderTagsByModel(payload: unknown): Map<string, string[]> {
@@ -698,6 +736,32 @@ function safeParseObject(raw: string): Record<string, unknown> {
 
 function readTrimmedString(value: unknown): string {
   return typeof value === "string" ? value.trim() : "";
+}
+
+function readRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+  return value as Record<string, unknown>;
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const floored = Math.floor(value);
+    return floored > 0 ? floored : undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      const floored = Math.floor(numeric);
+      return floored > 0 ? floored : undefined;
+    }
+  }
+  return undefined;
 }
 
 function toStringArray(value: unknown): string[] {

@@ -42,6 +42,8 @@ type AntigravityModelDetails = {
   description?: string;
   supportsThinking?: boolean;
   supportsImages?: boolean;
+  maxTokens?: number;
+  maxOutputTokens?: number;
   thinkingBudget?: number;
   minThinkingBudget?: number;
   quotaInfo?: {
@@ -61,6 +63,9 @@ export type AntigravityDiscoveredModel = {
   description: string;
   supportsThinking: boolean;
   supportsImages: boolean;
+  maxTokens?: number;
+  maxOutputTokens?: number;
+  contextWindowTokens?: number;
   thinkingBudget?: number;
   minThinkingBudget?: number;
 };
@@ -194,6 +199,9 @@ function normalizeAntigravityModels(response: FetchAvailableModelsResponse): Ant
       description: detailsBits.join(" | "),
       supportsThinking: details.supportsThinking !== false,
       supportsImages: details.supportsImages === true,
+      maxTokens: normalizePositiveInteger(details.maxTokens),
+      maxOutputTokens: normalizePositiveInteger(details.maxOutputTokens),
+      contextWindowTokens: inferContextWindowTokens(details),
       thinkingBudget: toFiniteNumber(details.thinkingBudget),
       minThinkingBudget: toFiniteNumber(details.minThinkingBudget),
     });
@@ -306,6 +314,23 @@ function inferDefaultThinkingLevel(model: AntigravityDiscoveredModel): ThinkingL
 
 function toFiniteNumber(value: unknown): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function normalizePositiveInteger(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const floored = Math.floor(value);
+  return floored > 0 ? floored : undefined;
+}
+
+function inferContextWindowTokens(details: AntigravityModelDetails): number | undefined {
+  const maxTokens = normalizePositiveInteger(details.maxTokens);
+  const maxOutputTokens = normalizePositiveInteger(details.maxOutputTokens);
+  if (maxTokens && maxOutputTokens && maxTokens > maxOutputTokens) {
+    return maxTokens - maxOutputTokens;
+  }
+  return maxTokens;
 }
 
 function clampPercent(value: number): number {

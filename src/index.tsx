@@ -75,7 +75,7 @@ type AuthOption = {
   description: string;
 };
 
-type AuthSelection = AuthProvider | "antigravity";
+type AuthSelection = AuthProvider;
 
 type ThinkingOption = {
   id: string;
@@ -108,7 +108,7 @@ type HistoryOption = {
 };
 
 type OnboardingOption = {
-  id: "auth_openai" | "auth_openrouter" | "auth_continue";
+  id: "auth_openai" | "auth_antigravity" | "auth_openrouter" | "auth_continue";
   label: string;
   description: string;
 };
@@ -220,7 +220,7 @@ type RpcHistoryListResponse = {
   next_cursor: number | null;
 };
 
-const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "openrouter"];
+const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "antigravity", "openrouter"];
 const TUI_RPC_DOGFOOD = true;
 
 const THINKING_OPTION_DETAILS: Record<ThinkingLevel, { label: string; description: string }> = {
@@ -256,6 +256,7 @@ const COMMAND_OPTIONS: CommandOption[] = [
   { name: "/model", description: "choose model and thinking level" },
   { name: "/limits", description: "show oauth usage limits" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
+  { name: "/compression", description: "compress conversation context to reduce token usage" },
   { name: "/skills", description: "list available skills from repo .agents/skills, ~/.loaf/skills, and ~/.agents/skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
@@ -266,10 +267,23 @@ const COMMAND_OPTIONS: CommandOption[] = [
 
 const SUPER_DEBUG_COMMAND = "/superdebug-69";
 const MAX_INPUT_HISTORY = 200;
-const MAX_VISIBLE_MESSAGES = 14;
-const MIN_VISIBLE_MESSAGE_ROWS = 2;
-const BASE_LAYOUT_ROWS = 8;
+const BASE_LAYOUT_ROWS = 9;
 const SELECTOR_WINDOW_SIZE = 10;
+const MIN_SELECTOR_WINDOW_SIZE = 4;
+const MAX_SELECTOR_WINDOW_SIZE = 16;
+const MIN_SUGGESTION_WINDOW_SIZE = 3;
+const MAX_SUGGESTION_WINDOW_SIZE = 12;
+const MIN_MESSAGE_ROWS_BUDGET = 3;
+const DEFAULT_TERMINAL_COLUMNS = 100;
+const DEFAULT_TERMINAL_ROWS = 24;
+const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS_UI = 272_000;
+const MIN_MODEL_CONTEXT_WINDOW_TOKENS_UI = 8_000;
+const MAX_MODEL_CONTEXT_WINDOW_TOKENS_UI = 2_000_000;
+const AUTO_COMPRESSION_CONTEXT_PERCENT_UI = 95;
+const MIN_AUTO_COMPRESSION_TOKEN_LIMIT_UI = 6_000;
+const APPROX_HISTORY_TOKENS_PER_CHAR_UI = 4;
+const APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS_UI = 20;
+const APPROX_HISTORY_IMAGE_TOKENS_UI = 850;
 const MAX_PENDING_IMAGES = 4;
 const MAX_IMAGE_FILE_BYTES = 8 * 1024 * 1024;
 const CLIPBOARD_IMAGE_CAPTURE_MAX_BUFFER = MAX_IMAGE_FILE_BYTES + 512 * 1024;
@@ -300,6 +314,7 @@ function App() {
     () =>
       ({
         openai: getDefaultModelOptionsForProvider("openai"),
+        antigravity: getDefaultModelOptionsForProvider("antigravity"),
         openrouter: getDefaultModelOptionsForProvider("openrouter"),
       }) satisfies Record<AuthProvider, ModelOption[]>,
     [],
@@ -310,6 +325,7 @@ function App() {
     legacyProvider: persistedState?.authProvider,
     hasOpenAiToken: false,
     hasOpenRouterKey: Boolean((persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey).trim()),
+    hasAntigravityToken: false,
   });
   const initialModel = resolveInitialModel(
     initialEnabledProviders,
@@ -331,6 +347,7 @@ function App() {
   const initialExaApiKey = persistedState?.exaApiKey ?? loafConfig.exaApiKey;
   const initialOnboardingCompleted = resolveInitialOnboardingCompleted(persistedState);
   const initialSkillCatalog = useMemo(() => loadSkillsCatalog(), []);
+  const [terminalViewport, setTerminalViewport] = useState(() => readTerminalViewport());
   const [input, setInput] = useState("");
   const [textInputResetKey, setTextInputResetKey] = useState(0);
   const [autocompletedSkillPrefix, setAutocompletedSkillPrefix] = useState<string | null>(null);
@@ -382,7 +399,6 @@ function App() {
   const suppressNextSubmitRef = useRef(false);
   const recentSlashCommandRef = useRef<{ payload: string; at: number } | null>(null);
   const statusCommandInFlightRef = useRef(false);
-  const previousAntigravityModelIdsRef = useRef<Set<string>>(new Set());
   const skipNextAntigravitySyncTokenRef = useRef<string | null>(null);
   const suppressCtrlVEchoRef = useRef<{
     active: boolean;
@@ -399,6 +415,9 @@ function App() {
   const streamingAssistantIdRef = useRef<number | null>(null);
   const streamingAssistantTextRef = useRef("");
   const pendingToolCallMessageIdsRef = useRef<number[]>([]);
+
+  const terminalColumns = terminalViewport.columns;
+  const terminalRows = terminalViewport.rows;
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
@@ -458,14 +477,15 @@ function App() {
 
   const applyModelList = (payload: RpcModelListResponse) => {
     const openai = payload.models.filter((option) => option.provider === "openai");
+    const antigravity = payload.models.filter((option) => option.provider === "antigravity");
     const openrouter = payload.models.filter((option) => option.provider === "openrouter");
     setModelOptionsByProvider({
       openai: openai.length > 0 ? openai : getDefaultModelOptionsForProvider("openai"),
+      antigravity:
+        antigravity.length > 0 ? antigravity : getDefaultModelOptionsForProvider("antigravity"),
       openrouter: openrouter.length > 0 ? openrouter : getDefaultModelOptionsForProvider("openrouter"),
     });
-    setAntigravityOpenAiModelOptions(
-      openai.filter((option) => (option.displayProvider ?? "").trim().toLowerCase() === "antigravity"),
-    );
+    setAntigravityOpenAiModelOptions(antigravity);
     setSelectedModel(payload.selected_model);
     setSelectedThinking(payload.selected_thinking);
     setSelectedOpenRouterProvider(payload.selected_openrouter_provider);
@@ -511,11 +531,37 @@ function App() {
     () => findProviderForModel(selectedModel, activeModelOptions) ?? null,
     [selectedModel, activeModelOptions],
   );
-  const authSummary = useMemo(() => {
-    const connected = [...enabledProviders] as string[];
-    if (hasAntigravityToken) {
-      connected.push("antigravity");
+  const compressionBudget = useMemo(
+    () =>
+      getCompressionBudgetForUi({
+        modelId: selectedModel,
+        provider: selectedModelProvider,
+        modelOptionsByProvider,
+      }),
+    [selectedModel, selectedModelProvider, modelOptionsByProvider],
+  );
+  const estimatedHistoryTokens = useMemo(
+    () => estimateHistoryTokensForUi(history),
+    [history],
+  );
+  const tokenBudgetLabel = useMemo(() => {
+    if (!compressionBudget) {
+      return "n/a";
     }
+    return `${formatTokenCountForUi(estimatedHistoryTokens)}/${formatTokenCountForUi(compressionBudget.autoCompressionTokenLimit)} tokens`;
+  }, [compressionBudget, estimatedHistoryTokens]);
+  const tokenBudgetPercent = useMemo(() => {
+    if (!compressionBudget || compressionBudget.autoCompressionTokenLimit <= 0) {
+      return 0;
+    }
+    return Math.min(999, Math.max(0, Math.round((estimatedHistoryTokens / compressionBudget.autoCompressionTokenLimit) * 100)));
+  }, [compressionBudget, estimatedHistoryTokens]);
+  const tokenBudgetColor = tokenBudgetPercent >= 100 ? "redBright" : tokenBudgetPercent >= 85 ? "yellow" : "gray";
+  const authSummary = useMemo(() => {
+    const connected = dedupeAuthProviders([
+      ...enabledProviders,
+      ...(hasAntigravityToken ? (["antigravity"] as const) : []),
+    ]);
     return connected.length > 0 ? connected.join(", ") : "not selected";
   }, [enabledProviders, hasAntigravityToken]);
   const authOptions = useMemo(
@@ -570,6 +616,34 @@ function App() {
     Boolean(activeSkillMention) && skillSuggestions.length > 0 && !suppressSkillSuggestions;
   const showCommandSuggestionPanel = commandSuggestions.length > 0 && !selector;
   const showSkillSuggestionPanel = showSkillSuggestions && !selector;
+  const selectorWindowSize = useMemo(
+    () =>
+      Math.max(
+        MIN_SELECTOR_WINDOW_SIZE,
+        Math.min(MAX_SELECTOR_WINDOW_SIZE, Math.floor((terminalRows - BASE_LAYOUT_ROWS) / 2)),
+      ),
+    [terminalRows],
+  );
+  const suggestionWindowSize = useMemo(
+    () =>
+      Math.max(
+        MIN_SUGGESTION_WINDOW_SIZE,
+        Math.min(MAX_SUGGESTION_WINDOW_SIZE, Math.floor((terminalRows - BASE_LAYOUT_ROWS) / 3)),
+      ),
+    [terminalRows],
+  );
+
+  useEffect(() => {
+    const handleResize = () => {
+      setTerminalViewport(readTerminalViewport());
+    };
+
+    handleResize();
+    process.stdout.on("resize", handleResize);
+    return () => {
+      process.stdout.off("resize", handleResize);
+    };
+  }, []);
 
   useEffect(() => {
     setCommandIndex((current) => {
@@ -1000,16 +1074,12 @@ function App() {
       return;
     }
     setModelOptionsByProvider((current) => {
-      const previousIds = previousAntigravityModelIdsRef.current;
-      const baseOpenAi = current.openai.filter((option) => !previousIds.has(option.id));
-      previousAntigravityModelIdsRef.current = new Set(antigravityOpenAiModelOptions.map((option) => option.id));
-
       return {
         ...current,
-        openai: mergeOpenAiAndAntigravityModels(
-          baseOpenAi.length > 0 ? baseOpenAi : getDefaultModelOptionsForProvider("openai"),
-          antigravityOpenAiModelOptions,
-        ),
+        antigravity:
+          antigravityOpenAiModelOptions.length > 0
+            ? antigravityOpenAiModelOptions
+            : getDefaultModelOptionsForProvider("antigravity"),
       };
     });
   }, [antigravityOpenAiModelOptions]);
@@ -1036,7 +1106,27 @@ function App() {
 
           setModelOptionsByProvider((current) => ({
             ...current,
-            openai: mergeOpenAiAndAntigravityModels(result.models, antigravityOpenAiModelOptions),
+            openai: result.models,
+          }));
+          continue;
+        }
+
+        if (provider === "antigravity") {
+          if (!antigravityAccessToken) {
+            continue;
+          }
+          const result = await discoverAntigravityModelOptions({
+            accessToken: antigravityAccessToken,
+          });
+          if (cancelled) {
+            return;
+          }
+
+          const antigravity = toAntigravityOpenAiModelOptions(result.models);
+          setAntigravityOpenAiModelOptions(antigravity);
+          setModelOptionsByProvider((current) => ({
+            ...current,
+            antigravity,
           }));
           continue;
         }
@@ -1063,7 +1153,7 @@ function App() {
     return () => {
       cancelled = true;
     };
-  }, [enabledProviders, openAiAccessToken, openAiAccountId, openRouterApiKey]);
+  }, [enabledProviders, openAiAccessToken, openAiAccountId, openRouterApiKey, antigravityAccessToken]);
 
   useEffect(() => {
     if (!secretsHydrated) {
@@ -1460,7 +1550,8 @@ function App() {
     >,
     index: number,
   ) => {
-    if (options.length <= SELECTOR_WINDOW_SIZE) {
+    const maxVisible = Math.max(MIN_SELECTOR_WINDOW_SIZE, selectorWindowSize || SELECTOR_WINDOW_SIZE);
+    if (options.length <= maxVisible) {
       return {
         startIndex: 0,
         activeIndex: Math.max(0, Math.min(index, Math.max(0, options.length - 1))),
@@ -1469,13 +1560,13 @@ function App() {
     }
 
     const activeIndex = Math.max(0, Math.min(index, options.length - 1));
-    const halfWindow = Math.floor(SELECTOR_WINDOW_SIZE / 2);
-    const maxStart = Math.max(0, options.length - SELECTOR_WINDOW_SIZE);
+    const halfWindow = Math.floor(maxVisible / 2);
+    const maxStart = Math.max(0, options.length - maxVisible);
     const startIndex = Math.max(0, Math.min(activeIndex - halfWindow, maxStart));
     return {
       startIndex,
       activeIndex,
-      options: options.slice(startIndex, startIndex + SELECTOR_WINDOW_SIZE),
+      options: options.slice(startIndex, startIndex + maxVisible),
     };
   };
 
@@ -1486,29 +1577,60 @@ function App() {
     thinkingLevel: ThinkingLevel;
     openRouterProvider?: string;
     bypassProviderSwitchWarning?: boolean;
+    compressImmediately?: boolean;
   }): Promise<void> => {
     const providerChanged =
       selectedModelProvider !== null && selectedModelProvider !== params.modelProvider;
     const hasContextToLose = history.length > 0;
+    const currentBudget = getCompressionBudgetForUi({
+      modelId: selectedModel,
+      provider: selectedModelProvider,
+      modelOptionsByProvider,
+    });
+    const targetBudget = getCompressionBudgetForUi({
+      modelId: params.modelId,
+      provider: params.modelProvider,
+      modelOptionsByProvider,
+    });
+    const lowerContextWindowTarget =
+      currentBudget !== null &&
+      targetBudget !== null &&
+      targetBudget.contextWindowTokens < currentBudget.contextWindowTokens;
+    const lowerContextWindowNeedsCompression =
+      lowerContextWindowTarget &&
+      targetBudget !== null &&
+      estimatedHistoryTokens >= targetBudget.autoCompressionTokenLimit;
+    const requiresSwitchWarning =
+      hasContextToLose &&
+      (providerChanged || lowerContextWindowNeedsCompression);
 
-    if (providerChanged && hasContextToLose && !params.bypassProviderSwitchWarning) {
-      const fromProvider = selectedModelProvider ?? "unknown";
+    if (requiresSwitchWarning && !params.bypassProviderSwitchWarning) {
+      const warningParts: string[] = [];
+      if (providerChanged) {
+        const fromProvider = selectedModelProvider ?? "unknown";
+        warningParts.push(`provider changes (${fromProvider} -> ${params.modelProvider})`);
+      }
+      if (lowerContextWindowNeedsCompression && currentBudget && targetBudget) {
+        warningParts.push(
+          `smaller context window (${formatTokenCountForUi(currentBudget.contextWindowTokens)} -> ${formatTokenCountForUi(targetBudget.contextWindowTokens)} tokens)`,
+        );
+      }
       const switchOptions: ProviderSwitchConfirmOption[] = [
         {
           id: "switch_confirm",
-          label: "switch and clear context",
-          description: "continue with the new provider and clear current conversation context",
+          label: "switch and compress now",
+          description: "apply model change now and compress context before next message",
         },
         {
           id: "switch_cancel",
           label: "cancel",
-          description: "keep current provider and current context",
+          description: "keep current model and existing context",
         },
       ];
       setInput("");
       setSelector({
         kind: "provider_switch_confirm",
-        title: `warning: switching ${fromProvider} -> ${params.modelProvider} will clear conversation context`,
+        title: `warning: switch will compress context (${warningParts.join("; ")})`,
         index: 0,
         options: switchOptions,
         modelId: params.modelId,
@@ -1521,30 +1643,47 @@ function App() {
     }
 
     setPending(true);
-    setStatusLabel("updating model...");
+    setStatusLabel(params.compressImmediately ? "updating model and compressing context..." : "updating model...");
     try {
-      await callRpc("model.select", {
+      const result = await callRpc<{
+        selected_model: string;
+        selected_provider: AuthProvider;
+        selected_thinking: ThinkingLevel;
+        selected_openrouter_provider: string;
+        compression?: {
+          requested: boolean;
+          applied: boolean;
+          reason: "none" | "auto" | "provider_switch";
+          estimated_tokens_before: number;
+          estimated_tokens_after: number;
+          model_context_window: number;
+          auto_limit: number;
+        };
+      }>("model.select", {
         model_id: params.modelId,
         provider: params.modelProvider,
         thinking_level: params.thinkingLevel,
         openrouter_provider: params.openRouterProvider,
+        session_id: getRpcSessionId(),
+        compress_immediately: params.compressImmediately === true,
       });
       await refreshRuntimeState();
-      if (providerChanged) {
-        await callRpc("history.clear_session", {
-          session_id: getRpcSessionId(),
-        });
-        await refreshRuntimeSessionState();
-      }
+      await refreshRuntimeSessionState();
 
       const providerSuffix =
         params.modelProvider === "openrouter"
           ? ` | provider ${params.openRouterProvider ?? OPENROUTER_PROVIDER_ANY_ID}`
           : "";
       const selectedOption = findModelOption(params.modelProvider, params.modelId, modelOptionsByProvider);
-      const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+      const isAntigravityModel = selectedOption?.provider === "antigravity";
+      const compressionSuffix =
+        result.compression?.requested === true
+          ? result.compression.applied
+            ? ` - context compressed (${formatTokenCountForUi(result.compression.estimated_tokens_before)} -> ${formatTokenCountForUi(result.compression.estimated_tokens_after)} est. tokens)`
+            : " - no compression needed"
+          : "";
       appendSystemMessage(
-        `model updated: ${params.modelLabel}${isAntigravityModel ? "" : ` (${params.thinkingLevel.toLowerCase()})`}${providerSuffix}${providerChanged ? " - context reset for provider switch" : ""}`,
+        `model updated: ${params.modelLabel}${isAntigravityModel ? "" : ` (${params.thinkingLevel.toLowerCase()})`}${providerSuffix}${compressionSuffix}`,
       );
       setInput("");
       setSelector(null);
@@ -1722,6 +1861,28 @@ function App() {
 
     if (command === "/history") {
       await runHistoryCommand(args);
+      return;
+    }
+
+    if (command === "/compression") {
+      try {
+        const result = await callRpc<{
+          handled: boolean;
+          output?: {
+            compressed?: boolean;
+          };
+        }>("command.execute", {
+          session_id: getRpcSessionId(),
+          raw_command: "/compression",
+        });
+        await refreshRuntimeSessionState();
+        if (result.output?.compressed === false) {
+          appendSystemMessage("nothing to compress yet.");
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        appendSystemMessage(`compression failed: ${message}`);
+      }
       return;
     }
 
@@ -2097,6 +2258,10 @@ function App() {
             openAuthSelector(true, true);
             return;
           }
+          if (onboardingChoice.id === "auth_antigravity") {
+            openAuthSelector(true, false);
+            return;
+          }
           if (onboardingChoice.id === "auth_openrouter") {
             openAuthSelector(true, true);
             return;
@@ -2198,7 +2363,7 @@ function App() {
             return;
           }
           if (switchChoice.id === "switch_cancel") {
-            appendSystemMessage("provider switch canceled.");
+            appendSystemMessage("model switch canceled.");
             setSelector(null);
             setInput("");
             return;
@@ -2210,6 +2375,7 @@ function App() {
             thinkingLevel: selector.thinkingLevel,
             openRouterProvider: selector.openRouterProvider,
             bypassProviderSwitchWarning: true,
+            compressImmediately: true,
           });
           return;
         }
@@ -2222,7 +2388,7 @@ function App() {
             return;
           }
           const isAntigravityModel =
-            (modelChoice.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+            modelChoice.provider === "antigravity";
           const thinkingOptions = getThinkingOptionsForModel(
             modelChoice.id,
             modelChoice.provider,
@@ -2402,46 +2568,51 @@ function App() {
     }
   });
 
-  const visibleMessageLimit = useMemo(() => {
-    const terminalRows = Number.isFinite(process.stdout.rows) ? process.stdout.rows : 24;
-    let reservedRows = BASE_LAYOUT_ROWS + (pending ? 1 : 0);
+  const commandSuggestionWindow = useMemo(
+    () => getListWindow(commandSuggestions, commandIndex, suggestionWindowSize),
+    [commandSuggestions, commandIndex, suggestionWindowSize],
+  );
+  const skillSuggestionWindow = useMemo(
+    () => getListWindow(skillSuggestions, skillIndex, suggestionWindowSize),
+    [skillSuggestions, skillIndex, suggestionWindowSize],
+  );
 
+  const selectorRows = useMemo(() => {
+    if (!selector) {
+      return 0;
+    }
+    if (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") {
+      return 3;
+    }
+
+    const allOptions = getSelectorAllOptions(selector);
+    const windowed = getSelectorOptionWindow(allOptions, selector.index);
+    const hasWindowHint = allOptions.length > windowed.options.length;
+    return windowed.options.length + (hasWindowHint ? 1 : 0) + 3;
+  }, [selector, input, selectorWindowSize]);
+
+  const visibleMessages = useMemo(() => {
+    let reservedRows = BASE_LAYOUT_ROWS + (pending ? 1 : 0) + selectorRows;
     if (showCommandSuggestionPanel) {
-      reservedRows += commandSuggestions.length + 2;
+      reservedRows += commandSuggestionWindow.options.length + 2;
     }
-
     if (showSkillSuggestionPanel) {
-      reservedRows += skillSuggestions.length + 2;
+      reservedRows += skillSuggestionWindow.options.length + 2;
     }
 
-    if (selector) {
-      if (selector.kind === "openrouter_api_key" || selector.kind === "exa_api_key") {
-        reservedRows += 3;
-      } else {
-        const allOptions = getSelectorAllOptions(selector);
-        const windowed = getSelectorOptionWindow(allOptions, selector.index);
-        const hasWindowHint = allOptions.length > windowed.options.length;
-        reservedRows += windowed.options.length + (hasWindowHint ? 1 : 0) + 3;
-      }
-    }
-
-    const availableRows = Math.max(0, terminalRows - reservedRows);
-    const maxMessagesByRows = Math.floor(availableRows / MIN_VISIBLE_MESSAGE_ROWS);
-    return Math.max(1, Math.min(MAX_VISIBLE_MESSAGES, maxMessagesByRows));
+    const availableRows = Math.max(MIN_MESSAGE_ROWS_BUDGET, terminalRows - reservedRows);
+    return selectVisibleMessagesByRows(messages, availableRows, terminalColumns);
   }, [
     pending,
+    selectorRows,
     showCommandSuggestionPanel,
     showSkillSuggestionPanel,
-    commandSuggestions.length,
-    skillSuggestions.length,
-    selector,
-    input,
+    commandSuggestionWindow,
+    skillSuggestionWindow,
+    terminalRows,
+    terminalColumns,
+    messages,
   ]);
-
-  const visibleMessages = useMemo(
-    () => messages.slice(-visibleMessageLimit),
-    [messages, visibleMessageLimit],
-  );
 
   const sendPrompt = async (prompt: string) => {
     const cleanPrompt = prompt.trim();
@@ -2520,6 +2691,10 @@ function App() {
           )
           : "not selected"}
       </Text>
+      <Text color={tokenBudgetColor}>
+        context: {tokenBudgetLabel}
+        {compressionBudget ? ` (${tokenBudgetPercent}% of auto-compression limit)` : ""}
+      </Text>
       <Newline />
       <Box flexDirection="column">
         {visibleMessages.map((message) => (
@@ -2574,21 +2749,41 @@ function App() {
       {pending && <Text color="yellow">{GLYPH_SYSTEM}{statusLabel}</Text>}
       {showCommandSuggestionPanel && (
         <Box flexDirection="column" marginTop={1}>
-          {commandSuggestions.map((suggestion, index) => (
-            <Text key={suggestion.name} color={index === commandIndex ? "magentaBright" : "gray"}>
-              {index === commandIndex ? ">" : " "} {suggestion.name} - {suggestion.description}
+          {commandSuggestionWindow.options.map((suggestion, windowIndex) => {
+            const absoluteIndex = commandSuggestionWindow.startIndex + windowIndex;
+            const selected = absoluteIndex === commandSuggestionWindow.activeIndex;
+            return (
+              <Text key={suggestion.name} color={selected ? "magentaBright" : "gray"}>
+                {selected ? ">" : " "} {suggestion.name} - {suggestion.description}
+              </Text>
+            );
+          })}
+          {commandSuggestions.length > commandSuggestionWindow.options.length && (
+            <Text color="gray">
+              showing {commandSuggestionWindow.startIndex + 1}-
+              {commandSuggestionWindow.startIndex + commandSuggestionWindow.options.length} of {commandSuggestions.length}
             </Text>
-          ))}
+          )}
           <Text color="gray">tab autocomplete | up/down navigate suggestions</Text>
         </Box>
       )}
       {showSkillSuggestionPanel && (
         <Box flexDirection="column" marginTop={1}>
-          {skillSuggestions.map((skill, index) => (
-            <Text key={skill.name} color={index === skillIndex ? "magentaBright" : "gray"}>
-              {index === skillIndex ? ">" : " "} ${skill.name} - {skill.descriptionPreview}
+          {skillSuggestionWindow.options.map((skill, windowIndex) => {
+            const absoluteIndex = skillSuggestionWindow.startIndex + windowIndex;
+            const selected = absoluteIndex === skillSuggestionWindow.activeIndex;
+            return (
+              <Text key={skill.name} color={selected ? "magentaBright" : "gray"}>
+                {selected ? ">" : " "} ${skill.name} - {skill.descriptionPreview}
+              </Text>
+            );
+          })}
+          {skillSuggestions.length > skillSuggestionWindow.options.length && (
+            <Text color="gray">
+              showing {skillSuggestionWindow.startIndex + 1}-
+              {skillSuggestionWindow.startIndex + skillSuggestionWindow.options.length} of {skillSuggestions.length}
             </Text>
-          ))}
+          )}
           <Text color="gray">enter/tab autocomplete | up/down navigate skills</Text>
         </Box>
       )}
@@ -2741,6 +2936,229 @@ function parseSteerCommand(rawInput: string): string | null {
   return payload || null;
 }
 
+function readTerminalViewport(): { columns: number; rows: number } {
+  const columns =
+    typeof process.stdout.columns === "number" && Number.isFinite(process.stdout.columns)
+      ? process.stdout.columns
+      : DEFAULT_TERMINAL_COLUMNS;
+  const rows =
+    typeof process.stdout.rows === "number" && Number.isFinite(process.stdout.rows)
+      ? process.stdout.rows
+      : DEFAULT_TERMINAL_ROWS;
+  return {
+    columns: Math.max(40, columns),
+    rows: Math.max(12, rows),
+  };
+}
+
+function getListWindow<T>(options: T[], index: number, windowSize: number): {
+  startIndex: number;
+  activeIndex: number;
+  options: T[];
+} {
+  if (options.length === 0) {
+    return {
+      startIndex: 0,
+      activeIndex: 0,
+      options: [],
+    };
+  }
+
+  const normalizedWindowSize = Math.max(1, Math.floor(windowSize));
+  if (options.length <= normalizedWindowSize) {
+    return {
+      startIndex: 0,
+      activeIndex: Math.max(0, Math.min(index, options.length - 1)),
+      options,
+    };
+  }
+
+  const activeIndex = Math.max(0, Math.min(index, options.length - 1));
+  const halfWindow = Math.floor(normalizedWindowSize / 2);
+  const maxStart = Math.max(0, options.length - normalizedWindowSize);
+  const startIndex = Math.max(0, Math.min(activeIndex - halfWindow, maxStart));
+  return {
+    startIndex,
+    activeIndex,
+    options: options.slice(startIndex, startIndex + normalizedWindowSize),
+  };
+}
+
+function selectVisibleMessagesByRows(
+  messages: UiMessage[],
+  availableRows: number,
+  terminalColumns: number,
+): UiMessage[] {
+  if (messages.length === 0) {
+    return [];
+  }
+
+  const maxRows = Math.max(MIN_MESSAGE_ROWS_BUDGET, Math.floor(availableRows));
+  let consumedRows = 0;
+  const selected: UiMessage[] = [];
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (!message) {
+      continue;
+    }
+    const estimatedRows = estimateUiMessageRowCount(message, terminalColumns);
+    if (selected.length > 0 && consumedRows + estimatedRows > maxRows) {
+      break;
+    }
+    selected.push(message);
+    consumedRows += estimatedRows;
+    if (consumedRows >= maxRows) {
+      break;
+    }
+  }
+
+  return selected.reverse();
+}
+
+function estimateUiMessageRowCount(message: UiMessage, terminalColumns: number): number {
+  const textWidth = Math.max(20, terminalColumns - 4);
+  const baseText = message.text || "[image]";
+  const textRows = estimateWrappedRows(baseText, textWidth);
+  const imageRows = Array.isArray(message.images) ? message.images.length : 0;
+  const marginRows = 1;
+  return Math.max(1, textRows + imageRows + marginRows);
+}
+
+function estimateWrappedRows(text: string, width: number): number {
+  const safeWidth = Math.max(8, Math.floor(width));
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let rows = 0;
+  for (const line of lines) {
+    const contentLength = line.length;
+    rows += Math.max(1, Math.ceil(contentLength / safeWidth));
+  }
+  return Math.max(1, rows);
+}
+
+function estimateHistoryTokensForUi(history: ChatMessage[]): number {
+  let total = 0;
+  for (const message of history) {
+    const text = message.text.replace(/\s+/g, " ").trim();
+    const textTokens = Math.ceil(text.length / APPROX_HISTORY_TOKENS_PER_CHAR_UI);
+    const imageCount = Array.isArray(message.images) ? message.images.length : 0;
+    total += APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS_UI + textTokens + imageCount * APPROX_HISTORY_IMAGE_TOKENS_UI;
+  }
+  return Math.max(0, total);
+}
+
+function getCompressionBudgetForUi(params: {
+  modelId: string;
+  provider: AuthProvider | null;
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>;
+}): { contextWindowTokens: number; autoCompressionTokenLimit: number } | null {
+  const normalizedModelId = params.modelId.trim();
+  if (!normalizedModelId) {
+    return null;
+  }
+
+  const contextWindowTokens = getModelContextWindowTokensForUi(params);
+  const autoCompressionTokenLimit = Math.min(
+    contextWindowTokens,
+    Math.max(
+      MIN_AUTO_COMPRESSION_TOKEN_LIMIT_UI,
+      Math.floor((contextWindowTokens * AUTO_COMPRESSION_CONTEXT_PERCENT_UI) / 100),
+    ),
+  );
+
+  return {
+    contextWindowTokens,
+    autoCompressionTokenLimit,
+  };
+}
+
+function getModelContextWindowTokensForUi(params: {
+  modelId: string;
+  provider: AuthProvider | null;
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>;
+}): number {
+  const normalizedModelId = params.modelId.trim();
+  const directOption =
+    params.provider !== null
+      ? findModelOption(params.provider, normalizedModelId, params.modelOptionsByProvider)
+      : getModelOptionsForProviders(AUTH_PROVIDER_ORDER, params.modelOptionsByProvider).find(
+          (option) => option.id === normalizedModelId,
+        );
+
+  const directWindow = normalizeContextWindowTokenCountForUi(directOption?.contextWindowTokens);
+  if (directWindow) {
+    return directWindow;
+  }
+
+  const inferredWindow = inferContextWindowTokensFromTextForUi(
+    [normalizedModelId, directOption?.label, directOption?.description].filter(Boolean).join(" "),
+  );
+  if (inferredWindow) {
+    return inferredWindow;
+  }
+
+  const slug = modelIdToSlug(normalizedModelId).toLowerCase();
+  if (slug.includes("mini")) {
+    return 128_000;
+  }
+  if (slug.includes("nano")) {
+    return 64_000;
+  }
+  return DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS_UI;
+}
+
+function normalizeContextWindowTokenCountForUi(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  const floored = Math.floor(value);
+  if (floored <= 0) {
+    return null;
+  }
+  return Math.max(
+    MIN_MODEL_CONTEXT_WINDOW_TOKENS_UI,
+    Math.min(MAX_MODEL_CONTEXT_WINDOW_TOKENS_UI, floored),
+  );
+}
+
+function inferContextWindowTokensFromTextForUi(text: string): number | null {
+  const normalized = text.replace(/\s+/g, " ").trim().toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  const matches = normalized.matchAll(/(\d+(?:[.,]\d+)?)\s*([mk])\b/g);
+  let best: number | null = null;
+  for (const match of matches) {
+    const numericRaw = (match[1] ?? "").replace(/,/g, ".");
+    const unit = match[2];
+    const value = Number(numericRaw);
+    if (!Number.isFinite(value) || value <= 0 || !unit) {
+      continue;
+    }
+
+    let candidate = 0;
+    if (unit === "m" && value >= 1 && value <= 2) {
+      candidate = Math.round(value * 1_000_000);
+    } else if (unit === "k" && value >= 16 && value <= 2_000) {
+      candidate = Math.round(value * 1_000);
+    }
+
+    const normalizedCandidate = normalizeContextWindowTokenCountForUi(candidate);
+    if (!normalizedCandidate) {
+      continue;
+    }
+    if (best === null || normalizedCandidate > best) {
+      best = normalizedCandidate;
+    }
+  }
+  return best;
+}
+
+function formatTokenCountForUi(value: number): string {
+  const normalized = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  return normalized.toLocaleString("en-US");
+}
+
 function shouldAutocompleteSkillInputOnEnter(rawInput: string, selectedSkillNameLower: string): boolean {
   const mention = findActiveSkillMentionToken(rawInput);
   if (!mention) {
@@ -2891,7 +3309,8 @@ type ToolExecutionRecord = {
 
 const TOOL_RENDER_DEFAULT_WIDTH = 100;
 const TOOL_RENDER_MIN_WIDTH = 24;
-const TOOL_OUTPUT_MAX_LINES = 5;
+const TOOL_OUTPUT_MIN_LINES = 4;
+const TOOL_OUTPUT_MAX_LINES_CAP = 16;
 
 function parseToolExecutionRecord(raw: unknown): ToolExecutionRecord | null {
   if (!isRecord(raw)) {
@@ -3028,14 +3447,23 @@ function formatToolOutputLines(name: string, input: Record<string, unknown>, res
 function truncateToolBodyLines(lines: string[]): string[] {
   const wrapWidth = Math.max(TOOL_RENDER_MIN_WIDTH, getToolWrapWidth() - 4);
   const wrapped = lines.flatMap((line) => wrapToolLines(line, wrapWidth));
-  if (wrapped.length <= TOOL_OUTPUT_MAX_LINES * 2) {
+  const maxLinesPerSection = getToolOutputMaxLines();
+  if (wrapped.length <= maxLinesPerSection * 2) {
     return wrapped;
   }
 
-  const head = wrapped.slice(0, TOOL_OUTPUT_MAX_LINES);
-  const tail = wrapped.slice(-TOOL_OUTPUT_MAX_LINES);
+  const head = wrapped.slice(0, maxLinesPerSection);
+  const tail = wrapped.slice(-maxLinesPerSection);
   const omitted = wrapped.length - (head.length + tail.length);
   return [...head, `… +${omitted} lines`, ...tail];
+}
+
+function getToolOutputMaxLines(): number {
+  const viewport = readTerminalViewport();
+  return Math.max(
+    TOOL_OUTPUT_MIN_LINES,
+    Math.min(TOOL_OUTPUT_MAX_LINES_CAP, Math.floor(viewport.rows * 0.2)),
+  );
 }
 
 function prefixToolBodyLines(lines: string[]): string[] {
@@ -3043,10 +3471,7 @@ function prefixToolBodyLines(lines: string[]): string[] {
 }
 
 function getToolWrapWidth(): number {
-  const columns =
-    typeof process.stdout.columns === "number" && Number.isFinite(process.stdout.columns)
-      ? process.stdout.columns
-      : TOOL_RENDER_DEFAULT_WIDTH;
+  const columns = readTerminalViewport().columns || TOOL_RENDER_DEFAULT_WIDTH;
   return Math.max(TOOL_RENDER_MIN_WIDTH, columns - 8);
 }
 
@@ -4037,46 +4462,15 @@ function toAntigravityOpenAiModelOptions(models: AntigravityDiscoveredModel[]): 
     const thinking = antigravityModelToThinkingLevels(model);
     options.push({
       id,
-      provider: "openai",
-      displayProvider: "antigravity",
+      provider: "antigravity",
       label: model.label.trim() || modelIdToLabel(id),
       description: model.description.trim() || "antigravity catalog model",
       supportedThinkingLevels: thinking.supportedThinkingLevels,
       defaultThinkingLevel: thinking.defaultThinkingLevel,
+      contextWindowTokens: model.contextWindowTokens,
     });
   }
   return options;
-}
-
-function mergeOpenAiAndAntigravityModels(baseOpenAi: ModelOption[], antigravityOpenAi: ModelOption[]): ModelOption[] {
-  if (antigravityOpenAi.length === 0) {
-    return baseOpenAi;
-  }
-
-  const merged = new Map<string, ModelOption>();
-  for (const option of baseOpenAi) {
-    merged.set(option.id, option);
-  }
-
-  for (const option of antigravityOpenAi) {
-    const existing = merged.get(option.id);
-    if (!existing) {
-      merged.set(option.id, option);
-      continue;
-    }
-
-    merged.set(option.id, {
-      ...existing,
-      displayProvider: existing.displayProvider ?? option.displayProvider,
-      supportedThinkingLevels:
-        existing.supportedThinkingLevels && existing.supportedThinkingLevels.length > 0
-          ? existing.supportedThinkingLevels
-          : option.supportedThinkingLevels,
-      defaultThinkingLevel: existing.defaultThinkingLevel ?? option.defaultThinkingLevel,
-    });
-  }
-
-  return Array.from(merged.values());
 }
 
 function resolveInitialOnboardingCompleted(persistedState: LoafPersistedState | null): boolean {
@@ -4141,12 +4535,18 @@ function isAuthSelectionConfigured(
 
 function buildOnboardingAuthOptions(enabledProviders: AuthProvider[]): OnboardingOption[] {
   const hasOpenAi = enabledProviders.includes("openai");
+  const hasAntigravity = enabledProviders.includes("antigravity");
   const hasOpenRouter = enabledProviders.includes("openrouter");
   return [
     {
       id: "auth_openai",
       label: hasOpenAi ? "openai oauth (connected)" : "connect openai oauth",
       description: "chatgpt account login for gpt models",
+    },
+    {
+      id: "auth_antigravity",
+      label: hasAntigravity ? "antigravity oauth (connected)" : "connect antigravity oauth",
+      description: "google cloud oauth for antigravity models",
     },
     {
       id: "auth_openrouter",
@@ -4166,6 +4566,7 @@ function resolveInitialEnabledProviders(params: {
   legacyProvider: AuthProvider | undefined;
   hasOpenAiToken: boolean;
   hasOpenRouterKey: boolean;
+  hasAntigravityToken: boolean;
 }): AuthProvider[] {
   const fromPersisted = dedupeAuthProviders(
     params.persistedProviders ??
@@ -4182,11 +4583,17 @@ function resolveInitialEnabledProviders(params: {
   if (params.hasOpenRouterKey) {
     inferred.push("openrouter");
   }
+  if (params.hasAntigravityToken) {
+    inferred.push("antigravity");
+  }
   if (loafConfig.preferredAuthProvider === "openai" && params.hasOpenAiToken) {
     inferred.unshift("openai");
   }
   if (loafConfig.preferredAuthProvider === "openrouter" && params.hasOpenRouterKey) {
     inferred.unshift("openrouter");
+  }
+  if (loafConfig.preferredAuthProvider === "antigravity" && params.hasAntigravityToken) {
+    inferred.unshift("antigravity");
   }
   return dedupeAuthProviders(inferred);
 }
@@ -4204,10 +4611,11 @@ function resolveInitialModel(
 }
 
 function getSelectableModelProviders(enabledProviders: AuthProvider[], hasAntigravityToken: boolean): AuthProvider[] {
+  const withoutAntigravity = enabledProviders.filter((provider) => provider !== "antigravity");
   if (!hasAntigravityToken) {
-    return enabledProviders;
+    return withoutAntigravity;
   }
-  return dedupeAuthProviders([...enabledProviders, "openai"]);
+  return dedupeAuthProviders([...withoutAntigravity, "antigravity"]);
 }
 
 function resolveModelForEnabledProviders(
@@ -4254,7 +4662,13 @@ function getEnvModelForProvider(provider: AuthProvider): string {
   if (provider === "openai") {
     return loafConfig.openaiModel.trim() || "gpt-4.1";
   }
-  return loafConfig.openrouterModel.trim();
+  if (provider === "openrouter") {
+    return loafConfig.openrouterModel.trim();
+  }
+  if (provider === "antigravity") {
+    return "";
+  }
+  return "";
 }
 
 function getModelOptionsForProvider(
@@ -4316,30 +4730,15 @@ function inferProviderFromModelId(modelId: string): AuthProvider | null {
 function dedupeAuthProviders(providers: AuthProvider[]): AuthProvider[] {
   const ordered: AuthProvider[] = [];
   for (const provider of providers) {
-    if ((provider !== "openai" && provider !== "openrouter") || ordered.includes(provider)) {
+    if (
+      (provider !== "openai" && provider !== "openrouter" && provider !== "antigravity") ||
+      ordered.includes(provider)
+    ) {
       continue;
     }
     ordered.push(provider);
   }
   return ordered;
-}
-
-function resetConversationForProviderSwitch(params: {
-  fromProvider: AuthProvider | null;
-  toProvider: AuthProvider;
-  setHistory: React.Dispatch<React.SetStateAction<ChatMessage[]>>;
-  setMessages: React.Dispatch<React.SetStateAction<UiMessage[]>>;
-  nextMessageId: () => number;
-}): void {
-  params.setHistory([]);
-  const fromLabel = params.fromProvider ?? "unknown";
-  params.setMessages([
-    {
-      id: params.nextMessageId(),
-      kind: "system",
-      text: `provider switched: ${fromLabel} -> ${params.toProvider}. conversation context was reset.`,
-    },
-  ]);
 }
 
 function getThinkingOptionsForModel(
@@ -4353,6 +4752,9 @@ function getThinkingOptionsForModel(
   }
 
   if (provider === "openai") {
+    return THINKING_OPTIONS_OPENAI_DEFAULT;
+  }
+  if (provider === "antigravity") {
     return THINKING_OPTIONS_OPENAI_DEFAULT;
   }
   return THINKING_OPTIONS_OPENROUTER_DEFAULT;
@@ -4394,7 +4796,7 @@ function formatModelSummary(
   const options = getModelOptionsForProvider(provider, modelOptionsByProvider);
   const selectedOption = options.find((option) => option.id === modelId);
   const label = selectedOption?.label || modelIdToLabel(modelId);
-  const isAntigravityModel = (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
+  const isAntigravityModel = selectedOption?.provider === "antigravity";
   if (isAntigravityModel) {
     return `${providerLabel} - ${label.toLowerCase()}`;
   }
@@ -4524,12 +4926,11 @@ function formatOpenAiUsageLine(label: string, window: OpenAiUsageSnapshot["prima
   }
 
   const remaining = `${Math.round(window.remainingPercent)}% remaining`;
-  const used = `${Math.round(window.usedPercent)}% used`;
   const reset =
     typeof window.resetAtEpochSeconds === "number"
-      ? `, resets ${formatResetTimestamp(window.resetAtEpochSeconds)}`
+      ? `resets ${formatResetTimestamp(window.resetAtEpochSeconds)}`
       : "";
-  return `${label}: ${remaining} (${used}${reset})`;
+  return `${label}: ${remaining} (${reset})`;
 }
 
 function formatAntigravityUsageLine(modelQuota: AntigravityUsageSnapshot["models"][number]): string {

@@ -14,6 +14,7 @@ export type ModelOption = {
   supportedThinkingLevels?: ThinkingLevel[];
   defaultThinkingLevel?: ThinkingLevel;
   routingProviders?: string[];
+  contextWindowTokens?: number;
 };
 
 export type ModelDiscoverySource = "remote" | "cache" | "fallback";
@@ -32,6 +33,7 @@ type CachedProviderModels = {
     supportedThinkingLevels?: ThinkingLevel[];
     defaultThinkingLevel?: ThinkingLevel;
     routingProviders?: string[];
+    contextWindowTokens?: number;
   }>;
 };
 
@@ -39,6 +41,7 @@ type ModelsCacheFile = {
   version: 1;
   openai?: CachedProviderModels;
   openrouter?: CachedProviderModels;
+  antigravity?: CachedProviderModels;
 };
 
 const MODEL_CACHE_FILE_PATH = path.join(getLoafDataDir(), "models-cache.json");
@@ -55,8 +58,15 @@ const DEFAULT_OPENAI_MODEL_OPTIONS: ModelOption[] = [];
 
 const DEFAULT_OPENROUTER_MODEL_OPTIONS: ModelOption[] = [];
 
+const DEFAULT_ANTIGRAVITY_MODEL_OPTIONS: ModelOption[] = [];
+
 export function getDefaultModelOptionsForProvider(provider: AuthProvider): ModelOption[] {
-  const defaults = provider === "openai" ? DEFAULT_OPENAI_MODEL_OPTIONS : DEFAULT_OPENROUTER_MODEL_OPTIONS;
+  const defaults =
+    provider === "openai"
+      ? DEFAULT_OPENAI_MODEL_OPTIONS
+      : provider === "openrouter"
+        ? DEFAULT_OPENROUTER_MODEL_OPTIONS
+        : DEFAULT_ANTIGRAVITY_MODEL_OPTIONS;
   return defaults.map((item) => ({ ...item }));
 }
 
@@ -185,6 +195,7 @@ function normalizeOpenAiModelOptions(catalog: OpenAiCatalogModel[]): ModelOption
       description: item.description.trim() || "server-advertised openai model",
       supportedThinkingLevels,
       defaultThinkingLevel,
+      contextWindowTokens: normalizeContextWindowTokens(item.contextWindowTokens),
     });
   }
 
@@ -207,6 +218,7 @@ function normalizeOpenRouterModelOptions(
     description: string;
     supportedParameters: string[];
     providerTags: string[];
+    contextWindowTokens?: number;
   }>,
 ): ModelOption[] {
   const byId = new Map<string, ModelOption>();
@@ -230,6 +242,7 @@ function normalizeOpenRouterModelOptions(
       supportedThinkingLevels,
       defaultThinkingLevel,
       routingProviders: dedupeStringArray(item.providerTags),
+      contextWindowTokens: normalizeContextWindowTokens(item.contextWindowTokens),
     });
   }
 
@@ -387,6 +400,7 @@ function mergeWithFallbacks(provider: AuthProvider, discovered: ModelOption[]): 
         existing.routingProviders && existing.routingProviders.length > 0
           ? existing.routingProviders
           : fallback.routingProviders,
+      contextWindowTokens: existing.contextWindowTokens ?? fallback.contextWindowTokens,
     });
   }
 
@@ -402,7 +416,9 @@ function readCachedProviderModels(provider: AuthProvider, requireFresh: boolean)
   const entry =
     provider === "openai"
       ? cache.openai
-      : cache.openrouter;
+      : provider === "openrouter"
+        ? cache.openrouter
+        : cache.antigravity;
   if (!entry || !Array.isArray(entry.models) || !entry.fetchedAt) {
     return [];
   }
@@ -441,6 +457,7 @@ function readCachedProviderModels(provider: AuthProvider, requireFresh: boolean)
         ? model.routingProviders.filter((item): item is string => typeof item === "string")
         : [],
     );
+    const contextWindowTokens = normalizeContextWindowTokens(model.contextWindowTokens);
     models.push({
       id,
       provider,
@@ -452,6 +469,7 @@ function readCachedProviderModels(provider: AuthProvider, requireFresh: boolean)
           ? defaultThinkingLevel
           : supportedThinkingLevels?.[Math.floor(Math.max(0, (supportedThinkingLevels.length - 1) / 2))],
       routingProviders: routingProviders.length > 0 ? routingProviders : undefined,
+      contextWindowTokens,
     });
   }
 
@@ -478,6 +496,7 @@ function writeCachedProviderModels(provider: AuthProvider, models: ModelOption[]
           .map((item) => item.trim().toLowerCase())
           .filter(Boolean),
       ),
+      contextWindowTokens: normalizeContextWindowTokens(model.contextWindowTokens),
     }))
     .filter((model) => model.id)
     .map((model) => ({
@@ -490,6 +509,7 @@ function writeCachedProviderModels(provider: AuthProvider, models: ModelOption[]
           ? model.defaultThinkingLevel
           : undefined,
       routingProviders: model.routingProviders.length > 0 ? model.routingProviders : undefined,
+      contextWindowTokens: normalizeContextWindowTokens(model.contextWindowTokens),
     }));
   const limitedModels = provider === "openai" ? sanitizedModels.slice(0, MAX_OPENAI_MODELS) : sanitizedModels;
 
@@ -502,11 +522,14 @@ function writeCachedProviderModels(provider: AuthProvider, models: ModelOption[]
     version: 1,
     openai: existing.openai,
     openrouter: existing.openrouter,
+    antigravity: existing.antigravity,
   };
   if (provider === "openai") {
     nextCache.openai = nextEntry;
-  } else {
+  } else if (provider === "openrouter") {
     nextCache.openrouter = nextEntry;
+  } else {
+    nextCache.antigravity = nextEntry;
   }
 
   writeModelsCacheFile(nextCache);
@@ -570,4 +593,12 @@ function dedupeStringArray(values: string[]): string[] {
     ordered.push(value);
   }
   return ordered;
+}
+
+function normalizeContextWindowTokens(value: unknown): number | undefined {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return undefined;
+  }
+  const floored = Math.floor(value);
+  return floored > 0 ? floored : undefined;
 }

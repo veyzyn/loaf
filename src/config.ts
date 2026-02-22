@@ -1,5 +1,5 @@
 export type ThinkingLevel = "OFF" | "MINIMAL" | "LOW" | "MEDIUM" | "HIGH" | "XHIGH";
-export type AuthProvider = "openrouter" | "openai";
+export type AuthProvider = "openrouter" | "openai" | "antigravity";
 
 const DEFAULT_SYSTEM_INSTRUCTION = [
   "you are loaf, a chill and practical cli assistant.",

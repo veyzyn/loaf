@@ -183,11 +183,15 @@ export class RpcRouter {
 
     this.handlers.set("model.list", async (params) => {
       const body = assertObjectParams(params ?? {}, "model.list");
-      const provider = assertOptionalString(body.provider, "provider", "model.list") as "openai" | "openrouter" | undefined;
-      if (provider && provider !== "openai" && provider !== "openrouter") {
+      const provider = assertOptionalString(body.provider, "provider", "model.list") as
+        | "openai"
+        | "openrouter"
+        | "antigravity"
+        | undefined;
+      if (provider && provider !== "openai" && provider !== "openrouter" && provider !== "antigravity") {
         throw buildRpcMethodError(
           JSON_RPC_ERROR.INVALID_PARAMS,
-          "provider must be one of: openai, openrouter",
+          "provider must be one of: openai, openrouter, antigravity",
           { reason: "invalid_params", field: "provider" },
         );
       }
@@ -197,20 +201,29 @@ export class RpcRouter {
     this.handlers.set("model.select", async (params) => {
       const body = assertObjectParams(params, "model.select");
       const modelId = assertString(body.model_id, "model_id", "model.select");
-      const provider = assertString(body.provider, "provider", "model.select") as "openai" | "openrouter";
-      if (provider !== "openai" && provider !== "openrouter") {
-        throw buildRpcMethodError(JSON_RPC_ERROR.INVALID_PARAMS, "provider must be openai or openrouter", {
+      const provider = assertString(body.provider, "provider", "model.select") as "openai" | "openrouter" | "antigravity";
+      if (provider !== "openai" && provider !== "openrouter" && provider !== "antigravity") {
+        throw buildRpcMethodError(
+          JSON_RPC_ERROR.INVALID_PARAMS,
+          "provider must be openai, openrouter, or antigravity",
+          {
           reason: "invalid_params",
           field: "provider",
-        });
+          },
+        );
       }
       const thinkingLevel = assertString(body.thinking_level, "thinking_level", "model.select");
       const openrouterProvider = assertOptionalString(body.openrouter_provider, "openrouter_provider", "model.select");
+      const sessionId = assertOptionalString(body.session_id, "session_id", "model.select");
+      const compressImmediately =
+        assertOptionalBoolean(body.compress_immediately, "compress_immediately", "model.select") ?? false;
       return this.runtime.modelSelect({
         model_id: modelId,
         provider,
         thinking_level: thinkingLevel as ThinkingLevel,
         openrouter_provider: openrouterProvider,
+        session_id: sessionId,
+        compress_immediately: compressImmediately,
       });
     });
 

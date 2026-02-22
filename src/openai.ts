@@ -68,6 +68,7 @@ export type OpenAiCatalogModel = {
   visibility?: string;
   defaultReasoningLevel?: string;
   supportedReasoningLevels?: OpenAiCatalogReasoningLevel[];
+  contextWindowTokens?: number;
 };
 
 export type OpenAiCatalogReasoningLevel = {
@@ -1301,6 +1302,7 @@ function parseOpenAiCatalogModels(payload: unknown): OpenAiCatalogModel[] {
         supportedReasoningLevels: parseReasoningLevels(
           row.supported_reasoning_levels ?? row.supported_reasoning_efforts,
         ),
+        contextWindowTokens: parseContextWindowTokens(row),
       });
     }
     return parsed;
@@ -1322,12 +1324,49 @@ function parseOpenAiCatalogModels(payload: unknown): OpenAiCatalogModel[] {
         supportedReasoningLevels: parseReasoningLevels(
           row.supported_reasoning_levels ?? row.supported_reasoning_efforts,
         ),
+        contextWindowTokens: parseContextWindowTokens(row),
       });
     }
     return parsed;
   }
 
   throw new Error("Unexpected OpenAI models response format.");
+}
+
+function parseContextWindowTokens(row: Record<string, unknown>): number | undefined {
+  const directCandidates = [
+    row.context_window,
+    row.context_length,
+    row.max_context_tokens,
+    row.max_input_tokens,
+    row.contextWindow,
+    row.contextLength,
+  ];
+
+  for (const candidate of directCandidates) {
+    const parsed = parsePositiveInteger(candidate);
+    if (parsed) {
+      return parsed;
+    }
+  }
+
+  const architecture = asRecord(row.architecture);
+  if (architecture) {
+    const architectureCandidates = [
+      architecture.context_window,
+      architecture.context_length,
+      architecture.max_context_tokens,
+      architecture.max_input_tokens,
+    ];
+    for (const candidate of architectureCandidates) {
+      const parsed = parsePositiveInteger(candidate);
+      if (parsed) {
+        return parsed;
+      }
+    }
+  }
+
+  return undefined;
 }
 
 function parseOpenAiUsageSnapshot(payload: unknown): OpenAiUsageSnapshot {
@@ -1420,6 +1459,25 @@ function toPositiveIntegerOrNull(value: unknown): number | null {
     return null;
   }
   return floored;
+}
+
+function parsePositiveInteger(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const floored = Math.floor(value);
+    return floored > 0 ? floored : undefined;
+  }
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return undefined;
+    }
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) {
+      const floored = Math.floor(numeric);
+      return floored > 0 ? floored : undefined;
+    }
+  }
+  return undefined;
 }
 
 function clampPercent(value: number): number {

@@ -496,7 +496,7 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function isAuthProvider(value: string): value is AuthProvider {
-  return value === "openai" || value === "openrouter";
+  return value === "openai" || value === "openrouter" || value === "antigravity";
 }
 
 function isThinkingLevel(value: string): value is ThinkingLevel {

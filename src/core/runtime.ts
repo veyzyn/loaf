@@ -136,7 +136,7 @@ type RuntimeSession = {
 const OPENROUTER_PROVIDER_ANY_ID = "any";
 const MAX_INPUT_HISTORY = 200;
 
-const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "openrouter"];
+const AUTH_PROVIDER_ORDER: AuthProvider[] = ["openai", "antigravity", "openrouter"];
 
 const THINKING_OPTIONS_OPENAI_DEFAULT: ThinkingLevel[] = [
   "OFF",
@@ -162,6 +162,17 @@ const SEARCH_WEB_PROMPT_EXTENSION = [
 ].join("\n");
 
 const OS_PROMPT_EXTENSION = buildOsPromptExtension();
+const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS = 272_000;
+const MIN_MODEL_CONTEXT_WINDOW_TOKENS = 8_000;
+const MAX_MODEL_CONTEXT_WINDOW_TOKENS = 2_000_000;
+const AUTO_COMPRESSION_CONTEXT_PERCENT = 95;
+const MIN_AUTO_COMPRESSION_TOKEN_LIMIT = 6_000;
+const MAX_COMPRESSION_SUMMARY_ENTRIES = 16;
+const MAX_COMPRESSION_SUMMARY_LINE_CHARS = 240;
+const MAX_COMPRESSION_SUMMARY_TOTAL_CHARS = 3_600;
+const APPROX_HISTORY_TOKENS_PER_CHAR = 4;
+const APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS = 20;
+const APPROX_HISTORY_IMAGE_TOKENS = 850;
 
 export class LoafCoreRuntime {
   private readonly rpcMode: boolean;
@@ -178,6 +189,7 @@ export class LoafCoreRuntime {
   private selectedOpenRouterProvider = OPENROUTER_PROVIDER_ANY_ID;
   private modelOptionsByProvider: Record<AuthProvider, ModelOption[]> = {
     openai: getDefaultModelOptionsForProvider("openai"),
+    antigravity: getDefaultModelOptionsForProvider("antigravity"),
     openrouter: getDefaultModelOptionsForProvider("openrouter"),
   };
   private selectedModel = "";
@@ -248,6 +260,7 @@ export class LoafCoreRuntime {
       legacyProvider: this.persistedState?.authProvider,
       hasOpenAiToken: false,
       hasOpenRouterKey: Boolean((this.persistedState?.openRouterApiKey ?? loafConfig.openrouterApiKey).trim()),
+      hasAntigravityToken: false,
     });
 
     this.enabledProviders = initialEnabledProviders;
@@ -300,6 +313,7 @@ export class LoafCoreRuntime {
     const antigravityTokenInfo = await loadPersistedAntigravityOauthTokenInfo();
     if (antigravityTokenInfo?.accessToken.trim()) {
       this.antigravityOauthTokenInfo = antigravityTokenInfo;
+      this.enabledProviders = dedupeAuthProviders([...this.enabledProviders, "antigravity"]);
       try {
         this.antigravityOauthProfile = await fetchAntigravityProfileData(antigravityTokenInfo.accessToken);
       } catch {
@@ -370,6 +384,103 @@ export class LoafCoreRuntime {
 
   private get hasAntigravityToken(): boolean {
     return (this.antigravityOauthTokenInfo?.accessToken ?? "").trim().length > 0;
+  }
+
+  private compressSessionHistory(params: {
+    session: RuntimeSession;
+    reason: "manual" | "auto" | "provider_switch";
+    fromProvider?: AuthProvider | null;
+    toProvider?: AuthProvider;
+    contextWindowTokens: number;
+    tokenLimit: number;
+    estimatedBeforeTokens?: number;
+  }): {
+    applied: boolean;
+    estimatedBeforeTokens: number;
+    estimatedAfterTokens: number;
+    summary: string;
+  } {
+    const previousHistory = params.session.history;
+    const estimatedBeforeTokens = params.estimatedBeforeTokens ?? estimateHistoryTokens(previousHistory);
+    if (previousHistory.length === 0) {
+      return {
+        applied: false,
+        estimatedBeforeTokens,
+        estimatedAfterTokens: estimatedBeforeTokens,
+        summary: "",
+      };
+    }
+
+    const initialKeepRecent = params.reason === "provider_switch" ? 4 : 8;
+    let keepRecentCount = Math.max(1, Math.min(initialKeepRecent, previousHistory.length));
+    let recent = previousHistory.slice(-keepRecentCount);
+    let summarySource = previousHistory.slice(0, Math.max(0, previousHistory.length - keepRecentCount));
+
+    // Ensure provider switches always produce a real compression (not just a no-op summary).
+    if (params.reason === "provider_switch" && summarySource.length === 0 && previousHistory.length > 1) {
+      keepRecentCount = 1;
+      recent = previousHistory.slice(-keepRecentCount);
+      summarySource = previousHistory.slice(0, previousHistory.length - keepRecentCount);
+    }
+
+    if (summarySource.length === 0) {
+      summarySource = previousHistory.slice(0, 1);
+      recent = previousHistory.slice(1);
+    }
+
+    const summary = buildCompressionSummaryText({
+      reason: params.reason,
+      modelId: this.selectedModel,
+      contextWindowTokens: params.contextWindowTokens,
+      tokenLimit: params.tokenLimit,
+      summarySource,
+    });
+    const compressedHistory: ChatMessage[] = [
+      {
+        role: "assistant",
+        text: summary,
+      },
+      ...recent,
+    ];
+
+    params.session.history = compressedHistory;
+    params.session.activeSession = null;
+    params.session.updatedAt = new Date().toISOString();
+    if (params.reason === "provider_switch" && params.toProvider) {
+      params.session.conversationProvider = params.toProvider;
+    }
+
+    this.appendSessionMessage(params.session, {
+      id: this.nextUiMessageId(),
+      kind: "assistant",
+      text: summary,
+    });
+
+    const estimatedAfterTokens = estimateHistoryTokens(compressedHistory);
+    if (params.reason === "provider_switch" && params.toProvider) {
+      const fromLabel = params.fromProvider ?? "unknown";
+      this.appendSystemMessage(
+        params.session,
+        `provider switched: ${fromLabel} -> ${params.toProvider}. context compressed (${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens).`,
+      );
+    } else if (params.reason === "auto") {
+      this.appendSystemMessage(
+        params.session,
+        `context compression (auto): ${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens (limit ${formatTokenCount(params.tokenLimit)} / window ${formatTokenCount(params.contextWindowTokens)}).`,
+      );
+    } else {
+      this.appendSystemMessage(
+        params.session,
+        `context compression complete: ${formatTokenCount(estimatedBeforeTokens)} -> ${formatTokenCount(estimatedAfterTokens)} est. tokens.`,
+      );
+    }
+
+    return {
+      applied: true,
+      estimatedBeforeTokens,
+      estimatedAfterTokens,
+      summary,
+    };
   }
 
   private appendSessionMessage(session: RuntimeSession, message: RuntimeUiMessage): void {
@@ -447,10 +558,6 @@ export class LoafCoreRuntime {
       steeringQueue: [],
       activeAbortController: null,
     };
-
-    if (params?.title?.trim()) {
-      this.appendSystemMessage(session, `session created: ${params.title.trim()}`);
-    }
 
     this.sessions.set(id, session);
     this.emit("state.changed", {
@@ -642,12 +749,7 @@ export class LoafCoreRuntime {
       return;
     }
 
-    const selectedOption = findModelOption(provider, this.selectedModel, this.modelOptionsByProvider);
-    const isAntigravityModel =
-      (selectedOption?.displayProvider ?? "").trim().toLowerCase() === "antigravity";
-
-    const hasProviderAccess =
-      this.enabledProviders.includes(provider) || (isAntigravityModel && provider === "openai");
+    const hasProviderAccess = this.enabledProviders.includes(provider);
     if (!hasProviderAccess) {
       const message = `provider ${provider} is not enabled`;
       this.appendSystemMessage(session, message);
@@ -659,7 +761,7 @@ export class LoafCoreRuntime {
       return;
     }
 
-    if (isAntigravityModel && !this.hasAntigravityToken) {
+    if (provider === "antigravity" && !this.hasAntigravityToken) {
       const message = "antigravity model selected, but no antigravity oauth token is available";
       this.appendSystemMessage(session, message);
       this.emit("session.error", {
@@ -670,7 +772,7 @@ export class LoafCoreRuntime {
       return;
     }
 
-    if (!isAntigravityModel && provider === "openai" && !this.hasOpenAiToken) {
+    if (provider === "openai" && !this.hasOpenAiToken) {
       const message = "openai model selected, but no chatgpt oauth token is available";
       this.appendSystemMessage(session, message);
       this.emit("session.error", {
@@ -706,6 +808,38 @@ export class LoafCoreRuntime {
     }
     await this.persistState();
 
+    const compressionBudget = getCompressionBudgetForModel({
+      modelId: this.selectedModel,
+      provider,
+      modelOptionsByProvider: this.modelOptionsByProvider,
+    });
+    const providerSwitchRequiresCompression =
+      session.conversationProvider !== null && session.conversationProvider !== provider && session.history.length > 0;
+    const estimatedHistoryTokens = estimateHistoryTokens(session.history);
+    if (providerSwitchRequiresCompression) {
+      this.compressSessionHistory({
+        session,
+        reason: "provider_switch",
+        fromProvider: session.conversationProvider,
+        toProvider: provider,
+        contextWindowTokens: compressionBudget.contextWindowTokens,
+        tokenLimit: compressionBudget.autoCompressionTokenLimit,
+        estimatedBeforeTokens: estimatedHistoryTokens,
+      });
+      session.activeSession = null;
+    } else if (
+      session.history.length > 0 &&
+      estimatedHistoryTokens >= compressionBudget.autoCompressionTokenLimit
+    ) {
+      this.compressSessionHistory({
+        session,
+        reason: "auto",
+        contextWindowTokens: compressionBudget.contextWindowTokens,
+        tokenLimit: compressionBudget.autoCompressionTokenLimit,
+        estimatedBeforeTokens: estimatedHistoryTokens,
+      });
+    }
+
     session.pending = true;
     session.statusLabel = this.selectedThinking === "OFF" ? "drafting response..." : "thinking...";
     session.steeringQueue = [];
@@ -717,21 +851,10 @@ export class LoafCoreRuntime {
       turn_id: turnId,
     });
 
-    const providerSwitchRequiresReset =
-      session.conversationProvider !== null && session.conversationProvider !== provider && session.history.length > 0;
-    const historyBase = providerSwitchRequiresReset ? [] : session.history;
-    if (providerSwitchRequiresReset) {
-      resetConversationForProviderSwitch({
-        fromProvider: session.conversationProvider,
-        toProvider: provider,
-        session,
-        nextMessageId: () => this.nextUiMessageId(),
-      });
-      session.activeSession = null;
-    }
+    const historyBase = session.history;
 
     const normalizedOpenRouterProvider =
-      !isAntigravityModel && provider === "openrouter"
+      provider === "openrouter"
         ? normalizeOpenRouterProviderSelection(this.selectedOpenRouterProvider)
         : undefined;
 
@@ -906,7 +1029,7 @@ export class LoafCoreRuntime {
       });
 
       const result =
-        isAntigravityModel
+        provider === "antigravity"
           ? await runAntigravityInferenceStream(
               {
                 accessToken: this.antigravityOauthTokenInfo?.accessToken ?? "",
@@ -1127,6 +1250,7 @@ export class LoafCoreRuntime {
       this.selectedOpenRouterProvider = OPENROUTER_PROVIDER_ANY_ID;
       this.modelOptionsByProvider = {
         openai: getDefaultModelOptionsForProvider("openai"),
+        antigravity: getDefaultModelOptionsForProvider("antigravity"),
         openrouter: getDefaultModelOptionsForProvider("openrouter"),
       };
       this.selectedModel = "";
@@ -1188,6 +1312,31 @@ export class LoafCoreRuntime {
         handled: true,
         output: {
           cleared: true,
+        },
+      };
+    }
+
+    if (command === "/compression") {
+      const provider = this.selectedModelProvider;
+      const budget = getCompressionBudgetForModel({
+        modelId: this.selectedModel,
+        provider,
+        modelOptionsByProvider: this.modelOptionsByProvider,
+      });
+      const result = this.compressSessionHistory({
+        session,
+        reason: "manual",
+        contextWindowTokens: budget.contextWindowTokens,
+        tokenLimit: budget.autoCompressionTokenLimit,
+      });
+      return {
+        handled: true,
+        output: {
+          compressed: result.applied,
+          estimated_tokens_before: result.estimatedBeforeTokens,
+          estimated_tokens_after: result.estimatedAfterTokens,
+          model_context_window: budget.contextWindowTokens,
+          auto_limit: budget.autoCompressionTokenLimit,
         },
       };
     }
@@ -1319,6 +1468,7 @@ export class LoafCoreRuntime {
 
       this.antigravityOauthTokenInfo = result.tokenInfo;
       this.antigravityOauthProfile = result.profile;
+      this.enabledProviders = dedupeAuthProviders([...this.enabledProviders, "antigravity"]);
       await this.syncAntigravityModelCatalog();
       this.ensureModelAndThinkingSelections();
       await this.persistState();
@@ -1450,6 +1600,8 @@ export class LoafCoreRuntime {
     provider: AuthProvider;
     thinking_level: ThinkingLevel;
     openrouter_provider?: string;
+    session_id?: string;
+    compress_immediately?: boolean;
   }) {
     const modelId = params.model_id.trim();
     if (!modelId) {
@@ -1474,6 +1626,79 @@ export class LoafCoreRuntime {
         normalizeOpenRouterProviderSelection(params.openrouter_provider) || OPENROUTER_PROVIDER_ANY_ID;
     }
 
+    let compression:
+      | {
+          requested: boolean;
+          applied: boolean;
+          reason: "none" | "auto" | "provider_switch";
+          estimated_tokens_before: number;
+          estimated_tokens_after: number;
+          model_context_window: number;
+          auto_limit: number;
+        }
+      | undefined;
+
+    if (params.compress_immediately) {
+      const sessionId = params.session_id?.trim();
+      if (!sessionId) {
+        throw new Error("session_id is required when compress_immediately is true");
+      }
+
+      const session = this.requireSession(sessionId);
+      const budget = getCompressionBudgetForModel({
+        modelId: this.selectedModel,
+        provider: params.provider,
+        modelOptionsByProvider: this.modelOptionsByProvider,
+      });
+      const estimatedBeforeTokens = estimateHistoryTokens(session.history);
+      const providerSwitchRequiresCompression =
+        session.conversationProvider !== null &&
+        session.conversationProvider !== params.provider &&
+        session.history.length > 0;
+      const budgetRequiresCompression =
+        session.history.length > 0 && estimatedBeforeTokens >= budget.autoCompressionTokenLimit;
+
+      const shouldCompress = providerSwitchRequiresCompression || budgetRequiresCompression;
+      if (shouldCompress) {
+        const reason: "provider_switch" | "auto" = providerSwitchRequiresCompression ? "provider_switch" : "auto";
+        const result = this.compressSessionHistory({
+          session,
+          reason,
+          fromProvider: providerSwitchRequiresCompression ? session.conversationProvider : undefined,
+          toProvider: providerSwitchRequiresCompression ? params.provider : undefined,
+          contextWindowTokens: budget.contextWindowTokens,
+          tokenLimit: budget.autoCompressionTokenLimit,
+          estimatedBeforeTokens,
+        });
+
+        if (providerSwitchRequiresCompression) {
+          session.activeSession = null;
+          // Keep provider bookkeeping aligned so the next prompt doesn't compress again.
+          session.conversationProvider = params.provider;
+        }
+
+        compression = {
+          requested: true,
+          applied: result.applied,
+          reason,
+          estimated_tokens_before: result.estimatedBeforeTokens,
+          estimated_tokens_after: result.estimatedAfterTokens,
+          model_context_window: budget.contextWindowTokens,
+          auto_limit: budget.autoCompressionTokenLimit,
+        };
+      } else {
+        compression = {
+          requested: true,
+          applied: false,
+          reason: "none",
+          estimated_tokens_before: estimatedBeforeTokens,
+          estimated_tokens_after: estimatedBeforeTokens,
+          model_context_window: budget.contextWindowTokens,
+          auto_limit: budget.autoCompressionTokenLimit,
+        };
+      }
+    }
+
     await this.persistState();
     this.emit("state.changed", {
       reason: "model_selected",
@@ -1485,6 +1710,7 @@ export class LoafCoreRuntime {
       selected_provider: params.provider,
       selected_thinking: this.selectedThinking,
       selected_openrouter_provider: this.selectedOpenRouterProvider,
+      compression,
     };
   }
 
@@ -1655,6 +1881,7 @@ export class LoafCoreRuntime {
 
     const next: Record<AuthProvider, ModelOption[]> = {
       openai: [...this.modelOptionsByProvider.openai],
+      antigravity: [...this.modelOptionsByProvider.antigravity],
       openrouter: [...this.modelOptionsByProvider.openrouter],
     };
 
@@ -1664,12 +1891,10 @@ export class LoafCoreRuntime {
           accessToken: this.openAiAccessToken,
           chatgptAccountId: this.openAiAccountId,
         });
-        next.openai = mergeOpenAiAndAntigravityModels(result.models, this.antigravityOpenAiModelOptions);
+        next.openai = result.models;
       } catch {
-        next.openai = mergeOpenAiAndAntigravityModels(next.openai, this.antigravityOpenAiModelOptions);
+        // keep previous options
       }
-    } else {
-      next.openai = mergeOpenAiAndAntigravityModels(next.openai, this.antigravityOpenAiModelOptions);
     }
 
     if (this.hasOpenRouterKey) {
@@ -1690,6 +1915,10 @@ export class LoafCoreRuntime {
     const accessToken = this.antigravityOauthTokenInfo?.accessToken.trim() ?? "";
     if (!accessToken) {
       this.antigravityOpenAiModelOptions = [];
+      this.modelOptionsByProvider = {
+        ...this.modelOptionsByProvider,
+        antigravity: getDefaultModelOptionsForProvider("antigravity"),
+      };
       return;
     }
 
@@ -1700,10 +1929,14 @@ export class LoafCoreRuntime {
       this.antigravityOpenAiModelOptions = toAntigravityOpenAiModelOptions(result.models);
       this.modelOptionsByProvider = {
         ...this.modelOptionsByProvider,
-        openai: mergeOpenAiAndAntigravityModels(this.modelOptionsByProvider.openai, this.antigravityOpenAiModelOptions),
+        antigravity: this.antigravityOpenAiModelOptions,
       };
     } catch {
       this.antigravityOpenAiModelOptions = [];
+      this.modelOptionsByProvider = {
+        ...this.modelOptionsByProvider,
+        antigravity: getDefaultModelOptionsForProvider("antigravity"),
+      };
     }
   }
 
@@ -1782,6 +2015,7 @@ const COMMAND_OPTIONS: Array<{ name: string; description: string }> = [
   { name: "/model", description: "choose model and thinking level" },
   { name: "/limits", description: "show oauth usage limits" },
   { name: "/history", description: "resume a saved chat (/history, /history last, /history <id>)" },
+  { name: "/compression", description: "compress conversation context to reduce token usage" },
   { name: "/skills", description: "list available skills" },
   { name: "/tools", description: "list registered tools" },
   { name: "/clear", description: "clear conversation messages" },
@@ -1881,11 +2115,207 @@ function resolveInitialOnboardingCompleted(persistedState: LoafPersistedState | 
   return true;
 }
 
+function estimateHistoryTokens(history: ChatMessage[]): number {
+  let total = 0;
+  for (const message of history) {
+    const textTokens = Math.ceil(collapseWhitespace(message.text).length / APPROX_HISTORY_TOKENS_PER_CHAR);
+    const imageCount = Array.isArray(message.images) ? message.images.length : 0;
+    total += APPROX_HISTORY_MESSAGE_OVERHEAD_TOKENS + textTokens + imageCount * APPROX_HISTORY_IMAGE_TOKENS;
+  }
+  return Math.max(0, total);
+}
+
+function getCompressionBudgetForModel(params: {
+  modelId: string;
+  provider: AuthProvider | null;
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>;
+}): {
+  contextWindowTokens: number;
+  autoCompressionTokenLimit: number;
+} {
+  const contextWindowTokens = getModelContextWindowTokens(params);
+  const autoCompressionTokenLimit = computeAutoCompressionTokenLimit(contextWindowTokens);
+  return {
+    contextWindowTokens,
+    autoCompressionTokenLimit,
+  };
+}
+
+function getModelContextWindowTokens(params: {
+  modelId: string;
+  provider: AuthProvider | null;
+  modelOptionsByProvider: Record<AuthProvider, ModelOption[]>;
+}): number {
+  const normalizedModelId = params.modelId.trim();
+  const directMatch =
+    params.provider !== null
+      ? findModelOption(params.provider, normalizedModelId, params.modelOptionsByProvider)
+      : getModelOptionsForProviders(AUTH_PROVIDER_ORDER, params.modelOptionsByProvider).find(
+          (candidate) => candidate.id === normalizedModelId,
+        );
+
+  const directWindow = normalizeContextWindowTokenCount(directMatch?.contextWindowTokens);
+  if (directWindow) {
+    return directWindow;
+  }
+
+  const inferredWindow = inferContextWindowTokensFromText(
+    [normalizedModelId, directMatch?.label, directMatch?.description].filter(Boolean).join(" "),
+  );
+  if (inferredWindow) {
+    return inferredWindow;
+  }
+
+  const slug = modelIdToSlug(normalizedModelId).toLowerCase();
+  if (slug.includes("mini")) {
+    return 128_000;
+  }
+  if (slug.includes("nano")) {
+    return 64_000;
+  }
+
+  return DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS;
+}
+
+function normalizeContextWindowTokenCount(value: unknown): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return null;
+  }
+  const floored = Math.floor(value);
+  if (floored <= 0) {
+    return null;
+  }
+  return Math.max(
+    MIN_MODEL_CONTEXT_WINDOW_TOKENS,
+    Math.min(MAX_MODEL_CONTEXT_WINDOW_TOKENS, floored),
+  );
+}
+
+function inferContextWindowTokensFromText(text: string): number | null {
+  const normalized = collapseWhitespace(text).toLowerCase();
+  if (!normalized) {
+    return null;
+  }
+
+  const matches = normalized.matchAll(/(\d+(?:[.,]\d+)?)\s*([mk])\b/g);
+  let best: number | null = null;
+  for (const match of matches) {
+    const numericRaw = (match[1] ?? "").replace(/,/g, ".");
+    const unit = match[2];
+    const value = Number(numericRaw);
+    if (!Number.isFinite(value) || value <= 0 || !unit) {
+      continue;
+    }
+
+    let candidate = 0;
+    if (unit === "m" && value >= 1 && value <= 2) {
+      candidate = Math.round(value * 1_000_000);
+    } else if (unit === "k" && value >= 16 && value <= 2_000) {
+      candidate = Math.round(value * 1_000);
+    }
+
+    const normalizedCandidate = normalizeContextWindowTokenCount(candidate);
+    if (!normalizedCandidate) {
+      continue;
+    }
+    if (best === null || normalizedCandidate > best) {
+      best = normalizedCandidate;
+    }
+  }
+  return best;
+}
+
+function computeAutoCompressionTokenLimit(contextWindowTokens: number): number {
+  const normalizedWindow = normalizeContextWindowTokenCount(contextWindowTokens) ?? DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS;
+  const computedLimit = Math.floor((normalizedWindow * AUTO_COMPRESSION_CONTEXT_PERCENT) / 100);
+  const boundedLimit = Math.max(MIN_AUTO_COMPRESSION_TOKEN_LIMIT, computedLimit);
+  return Math.min(normalizedWindow, boundedLimit);
+}
+
+function buildCompressionSummaryText(params: {
+  reason: "manual" | "auto" | "provider_switch";
+  modelId: string;
+  contextWindowTokens: number;
+  tokenLimit: number;
+  summarySource: ChatMessage[];
+}): string {
+  const entries = params.summarySource
+    .map((message) => {
+      const text = collapseWhitespace(message.text);
+      if (!text || isCompressionMetaMessage(text)) {
+        return "";
+      }
+      const roleLabel = message.role === "assistant" ? "assistant" : "user";
+      const imageCount = Array.isArray(message.images) ? message.images.length : 0;
+      const imageSuffix = imageCount > 0 ? ` [images: ${imageCount}]` : "";
+      return `${roleLabel}: ${clipInline(text, MAX_COMPRESSION_SUMMARY_LINE_CHARS)}${imageSuffix}`;
+    })
+    .filter(Boolean);
+
+  const selectedEntries = selectCompressionEntries(entries, MAX_COMPRESSION_SUMMARY_ENTRIES);
+  const modelLabel = params.modelId.trim() || "unknown-model";
+  const lines = [
+    "[conversation compression]",
+    `reason: ${params.reason.replace("_", " ")}`,
+    `model: ${modelLabel}`,
+    `window: ${formatTokenCount(params.contextWindowTokens)} tokens | auto limit: ${formatTokenCount(params.tokenLimit)} tokens`,
+    "condensed prior context:",
+  ];
+
+  if (selectedEntries.length === 0) {
+    lines.push("- no prior text content to summarize.");
+  } else {
+    for (const entry of selectedEntries) {
+      lines.push(entry === "..." ? "- ..." : `- ${entry}`);
+    }
+  }
+
+  return clipInline(lines.join("\n"), MAX_COMPRESSION_SUMMARY_TOTAL_CHARS);
+}
+
+function selectCompressionEntries(entries: string[], maxEntries: number): string[] {
+  if (entries.length <= maxEntries) {
+    return entries;
+  }
+
+  const headCount = Math.max(2, Math.floor(maxEntries / 3));
+  const tailCount = Math.max(2, maxEntries - headCount);
+  return [...entries.slice(0, headCount), "...", ...entries.slice(-tailCount)];
+}
+
+function isCompressionMetaMessage(text: string): boolean {
+  const normalized = text.toLowerCase();
+  return (
+    normalized.includes("[conversation compression]") ||
+    normalized.startsWith("context compression complete:") ||
+    normalized.startsWith("context compression (auto):") ||
+    normalized.includes("context compressed")
+  );
+}
+
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+function clipInline(text: string, maxLength: number): string {
+  const compact = text.trim();
+  if (compact.length <= maxLength) {
+    return compact;
+  }
+  return `${compact.slice(0, Math.max(0, maxLength - 3))}...`;
+}
+
+function formatTokenCount(value: number): string {
+  const normalized = Number.isFinite(value) ? Math.max(0, Math.floor(value)) : 0;
+  return normalized.toLocaleString("en-US");
+}
+
 function resolveInitialEnabledProviders(params: {
   persistedProviders: AuthProvider[] | undefined;
   legacyProvider: AuthProvider | undefined;
   hasOpenAiToken: boolean;
   hasOpenRouterKey: boolean;
+  hasAntigravityToken: boolean;
 }): AuthProvider[] {
   const fromPersisted = dedupeAuthProviders(
     params.persistedProviders ??
@@ -1902,11 +2332,17 @@ function resolveInitialEnabledProviders(params: {
   if (params.hasOpenRouterKey) {
     inferred.push("openrouter");
   }
+  if (params.hasAntigravityToken) {
+    inferred.push("antigravity");
+  }
   if (loafConfig.preferredAuthProvider === "openai" && params.hasOpenAiToken) {
     inferred.unshift("openai");
   }
   if (loafConfig.preferredAuthProvider === "openrouter" && params.hasOpenRouterKey) {
     inferred.unshift("openrouter");
+  }
+  if (loafConfig.preferredAuthProvider === "antigravity" && params.hasAntigravityToken) {
+    inferred.unshift("antigravity");
   }
   return dedupeAuthProviders(inferred);
 }
@@ -1914,7 +2350,10 @@ function resolveInitialEnabledProviders(params: {
 function dedupeAuthProviders(providers: AuthProvider[]): AuthProvider[] {
   const ordered: AuthProvider[] = [];
   for (const provider of providers) {
-    if ((provider !== "openai" && provider !== "openrouter") || ordered.includes(provider)) {
+    if (
+      (provider !== "openai" && provider !== "openrouter" && provider !== "antigravity") ||
+      ordered.includes(provider)
+    ) {
       continue;
     }
     ordered.push(provider);
@@ -1935,10 +2374,11 @@ function resolveInitialModel(
 }
 
 function getSelectableModelProviders(enabledProviders: AuthProvider[], hasAntigravityToken: boolean): AuthProvider[] {
+  const withoutAntigravity = enabledProviders.filter((provider) => provider !== "antigravity");
   if (!hasAntigravityToken) {
-    return enabledProviders;
+    return withoutAntigravity;
   }
-  return dedupeAuthProviders([...enabledProviders, "openai"]);
+  return dedupeAuthProviders([...withoutAntigravity, "antigravity"]);
 }
 
 function resolveModelForEnabledProviders(
@@ -1984,7 +2424,10 @@ function getEnvModelForProvider(provider: AuthProvider): string {
   if (provider === "openai") {
     return loafConfig.openaiModel.trim() || "gpt-4.1";
   }
-  return loafConfig.openrouterModel.trim();
+  if (provider === "openrouter") {
+    return loafConfig.openrouterModel.trim();
+  }
+  return "";
 }
 
 function getModelOptionsForProvider(
@@ -2052,6 +2495,9 @@ function getThinkingOptionsForModel(
   if (provider === "openai") {
     return THINKING_OPTIONS_OPENAI_DEFAULT;
   }
+  if (provider === "antigravity") {
+    return THINKING_OPTIONS_OPENAI_DEFAULT;
+  }
   return THINKING_OPTIONS_OPENROUTER_DEFAULT;
 }
 
@@ -2106,61 +2552,13 @@ function toAntigravityOpenAiModelOptions(models: AntigravityDiscoveredModel[]): 
     const thinking = antigravityModelToThinkingLevels(model);
     options.push({
       id,
-      provider: "openai",
-      displayProvider: "antigravity",
+      provider: "antigravity",
       label: model.label.trim() || modelIdToLabel(id),
       description: model.description.trim() || "antigravity catalog model",
       supportedThinkingLevels: thinking.supportedThinkingLevels,
       defaultThinkingLevel: thinking.defaultThinkingLevel,
+      contextWindowTokens: model.contextWindowTokens,
     });
   }
   return options;
-}
-
-function mergeOpenAiAndAntigravityModels(baseOpenAi: ModelOption[], antigravityOpenAi: ModelOption[]): ModelOption[] {
-  if (antigravityOpenAi.length === 0) {
-    return baseOpenAi;
-  }
-
-  const merged = new Map<string, ModelOption>();
-  for (const option of baseOpenAi) {
-    merged.set(option.id, option);
-  }
-
-  for (const option of antigravityOpenAi) {
-    const existing = merged.get(option.id);
-    if (!existing) {
-      merged.set(option.id, option);
-      continue;
-    }
-
-    merged.set(option.id, {
-      ...existing,
-      displayProvider: existing.displayProvider ?? option.displayProvider,
-      supportedThinkingLevels:
-        existing.supportedThinkingLevels && existing.supportedThinkingLevels.length > 0
-          ? existing.supportedThinkingLevels
-          : option.supportedThinkingLevels,
-      defaultThinkingLevel: existing.defaultThinkingLevel ?? option.defaultThinkingLevel,
-    });
-  }
-
-  return Array.from(merged.values());
-}
-
-function resetConversationForProviderSwitch(params: {
-  fromProvider: AuthProvider | null;
-  toProvider: AuthProvider;
-  session: RuntimeSession;
-  nextMessageId: () => number;
-}): void {
-  params.session.history = [];
-  const fromLabel = params.fromProvider ?? "unknown";
-  params.session.messages = [
-    {
-      id: params.nextMessageId(),
-      kind: "system",
-      text: `provider switched: ${fromLabel} -> ${params.toProvider}. conversation context was reset.`,
-    },
-  ];
 }
