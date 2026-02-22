@@ -372,7 +372,9 @@ function App() {
   const [inputHistoryIndex, setInputHistoryIndex] = useState<number | null>(null);
   const [inputHistoryDraft, setInputHistoryDraft] = useState("");
   const [messages, setMessages] = useState<UiMessage[]>([]);
-  const nextIdRef = useRef(1);
+  // Keep local-only UI rows in a negative id range so they never collide with
+  // runtime-emitted message ids (which are positive, server-generated ids).
+  const nextIdRef = useRef(-1);
   const activeInferenceAbortControllerRef = useRef<AbortController | null>(null);
   const steeringQueueRef = useRef<ChatMessage[]>([]);
   const queuedPromptsRef = useRef<string[]>([]);
@@ -396,10 +398,11 @@ function App() {
   const rpcEventUnsubscribeRef = useRef<(() => void) | null>(null);
   const streamingAssistantIdRef = useRef<number | null>(null);
   const streamingAssistantTextRef = useRef("");
+  const pendingToolCallMessageIdsRef = useRef<number[]>([]);
 
   const nextMessageId = () => {
     const id = nextIdRef.current;
-    nextIdRef.current += 1;
+    nextIdRef.current -= 1;
     return id;
   };
 
@@ -472,6 +475,7 @@ function App() {
     setPending(state.pending);
     setStatusLabel(state.statusLabel || (state.pending ? "working..." : "ready"));
     setMessages(state.messages.map((message) => toUiMessage(message)));
+    pendingToolCallMessageIdsRef.current = [];
     setHistory(state.history);
     setConversationProvider(state.conversationProvider);
   };
@@ -546,23 +550,24 @@ function App() {
     return COMMAND_OPTIONS.filter((command) => command.name.startsWith(query));
   }, [input]);
 
+  const activeSkillMention = useMemo(() => findActiveSkillMentionToken(input), [input]);
   const skillSuggestions = useMemo(() => {
-    if (!input.startsWith("$")) {
+    if (!activeSkillMention) {
       return [] as SkillDefinition[];
     }
-    const firstToken = input.trim().split(/\s+/)[0] ?? "";
-    const query = firstToken.slice(1).trim().toLowerCase();
+
+    const query = activeSkillMention.query;
     if (!query) {
       return availableSkills;
     }
     return availableSkills.filter((skill) => skill.nameLower.startsWith(query));
-  }, [input, availableSkills]);
+  }, [activeSkillMention, availableSkills]);
 
   const suppressSkillSuggestions = Boolean(
     autocompletedSkillPrefix && input.startsWith(autocompletedSkillPrefix),
   );
   const showSkillSuggestions =
-    input.startsWith("$") && skillSuggestions.length > 0 && !suppressSkillSuggestions;
+    Boolean(activeSkillMention) && skillSuggestions.length > 0 && !suppressSkillSuggestions;
   const showCommandSuggestionPanel = commandSuggestions.length > 0 && !selector;
   const showSkillSuggestionPanel = showSkillSuggestions && !selector;
 
@@ -585,12 +590,12 @@ function App() {
   }, [skillSuggestions.length]);
 
   useEffect(() => {
-    if (!input.startsWith("$")) {
+    if (!activeSkillMention) {
       return;
     }
     const catalog = loadSkillsCatalog();
     setAvailableSkills(catalog.skills);
-  }, [input]);
+  }, [activeSkillMention]);
 
   useEffect(() => {
     if (autocompletedSkillPrefix && !input.startsWith(autocompletedSkillPrefix)) {
@@ -745,7 +750,16 @@ function App() {
       if (event.type === "session.tool.call.started") {
         const row = formatToolStartRow(payload.data);
         if (row) {
-          appendRuntimeSystemMessage(row);
+          const messageId = nextMessageId();
+          setMessages((current) => [
+            ...current,
+            {
+              id: messageId,
+              kind: "system",
+              text: row,
+            },
+          ]);
+          pendingToolCallMessageIdsRef.current.push(messageId);
         }
         return;
       }
@@ -753,23 +767,28 @@ function App() {
       if (event.type === "session.tool.call.completed") {
         const row = formatToolCompletedRow(payload.data);
         if (row) {
-          appendRuntimeSystemMessage(row);
+          const pendingId = pendingToolCallMessageIdsRef.current.shift();
+          if (typeof pendingId === "number") {
+            setMessages((current) =>
+              current.map((message) =>
+                message.id === pendingId
+                  ? {
+                      ...message,
+                      text: row,
+                    }
+                  : message,
+              ),
+            );
+          } else {
+            appendRuntimeSystemMessage(row);
+          }
         }
         return;
       }
 
       if (event.type === "session.tool.results") {
-        const rows = formatToolRows(payload.data);
-        if (rows.length > 0) {
-          setMessages((current) => [
-            ...current,
-            ...rows.map((row) => ({
-              id: nextMessageId(),
-              kind: "system" as const,
-              text: row,
-            })),
-          ]);
-        }
+        // `session.tool.call.completed` already renders per-call completion rows.
+        // Skip aggregate rows here to avoid duplicate tool output in transcript.
         return;
       }
 
@@ -1906,8 +1925,12 @@ function App() {
   };
 
   const applySkillAutocomplete = (rawInput: string, suggestionName: string) => {
-    setInput(replaceLeadingSkillTokenWithSuggestion(rawInput, suggestionName));
-    setAutocompletedSkillPrefix(`$${suggestionName} `);
+    const replacement = replaceActiveSkillTokenWithSuggestion(rawInput, suggestionName);
+    if (!replacement) {
+      return;
+    }
+    setInput(replacement.text);
+    setAutocompletedSkillPrefix(replacement.prefix);
     // Remount controlled TextInput so cursor jumps to the end after autocomplete.
     setTextInputResetKey((current) => current + 1);
   };
@@ -2523,7 +2546,7 @@ function App() {
                       const absoluteIndex = windowed.startIndex + windowIndex;
                       const selected = absoluteIndex === windowed.activeIndex;
                       return (
-                        <Text key={`${selector.kind}-${option.id}`} color={selected ? "magentaBright" : "gray"}>
+                        <Text key={`${selector.kind}-${absoluteIndex}-${option.id}`} color={selected ? "magentaBright" : "gray"}>
                           {selected ? ">" : " "} {option.label} - {selector.kind === "model" ? getModelProviderDisplayLabel(option as ModelOption) : option.description}
                         </Text>
                       );
@@ -2637,7 +2660,7 @@ function App() {
               return;
             }
 
-            if (showSkillSuggestions && submitted.startsWith("$")) {
+            if (showSkillSuggestions) {
               const suggestion = skillSuggestions[skillIndex];
               if (suggestion && shouldAutocompleteSkillInputOnEnter(submitted, suggestion.nameLower)) {
                 applySkillAutocomplete(submitted, suggestion.name);
@@ -2718,29 +2741,14 @@ function parseSteerCommand(rawInput: string): string | null {
   return payload || null;
 }
 
-function replaceLeadingSkillTokenWithSuggestion(rawInput: string, suggestionName: string): string {
-  const trimmed = rawInput.trimStart();
-  const firstSpaceIndex = trimmed.indexOf(" ");
-  if (firstSpaceIndex < 0) {
-    return `$${suggestionName} `;
-  }
-  const remainder = trimmed.slice(firstSpaceIndex).trim();
-  if (!remainder) {
-    return `$${suggestionName} `;
-  }
-  return `$${suggestionName} ${remainder}`;
-}
-
 function shouldAutocompleteSkillInputOnEnter(rawInput: string, selectedSkillNameLower: string): boolean {
-  const trimmed = rawInput.trimStart();
-  if (!trimmed.startsWith("$")) {
+  const mention = findActiveSkillMentionToken(rawInput);
+  if (!mention) {
     return false;
   }
 
-  const firstSpaceIndex = trimmed.indexOf(" ");
-  const firstToken = firstSpaceIndex < 0 ? trimmed : trimmed.slice(0, firstSpaceIndex);
-  const enteredSkillName = firstToken.slice(1).trim().toLowerCase();
-  const trailingContent = firstSpaceIndex < 0 ? "" : trimmed.slice(firstSpaceIndex + 1).trim();
+  const enteredSkillName = mention.query;
+  const trailingContent = rawInput.slice(mention.end).trim();
   const hasTrailingPromptText = trailingContent.length > 0;
   const isExactSkillMatch = enteredSkillName === selectedSkillNameLower;
 
@@ -2749,6 +2757,56 @@ function shouldAutocompleteSkillInputOnEnter(rawInput: string, selectedSkillName
   }
 
   return true;
+}
+
+type ActiveSkillMentionToken = {
+  start: number;
+  end: number;
+  query: string;
+};
+
+function findActiveSkillMentionToken(rawInput: string): ActiveSkillMentionToken | null {
+  const mentionPattern = /(^|\s)\$([a-zA-Z0-9._:-]*)/g;
+  let match: RegExpExecArray | null;
+  while ((match = mentionPattern.exec(rawInput)) !== null) {
+    const leftBoundary = match[1] ?? "";
+    const mentionValue = match[2] ?? "";
+    const start = match.index + leftBoundary.length;
+    const end = start + 1 + mentionValue.length;
+    const nextChar = rawInput[end];
+    if (nextChar && !/\s/.test(nextChar)) {
+      continue;
+    }
+
+    return {
+      start,
+      end,
+      query: mentionValue.toLowerCase(),
+    };
+  }
+
+  return null;
+}
+
+function replaceActiveSkillTokenWithSuggestion(
+  rawInput: string,
+  suggestionName: string,
+): { text: string; prefix: string } | null {
+  const mention = findActiveSkillMentionToken(rawInput);
+  if (!mention) {
+    return null;
+  }
+
+  const before = rawInput.slice(0, mention.start);
+  const after = rawInput.slice(mention.end);
+  const mentionText = `$${suggestionName}`;
+  const spacer = after.length === 0 ? " " : "";
+  const nextText = `${before}${mentionText}${spacer}${after}`;
+
+  return {
+    text: nextText,
+    prefix: `${before}${mentionText} `,
+  };
 }
 
 function isAbortError(error: unknown): boolean {
@@ -2769,35 +2827,10 @@ function formatToolRows(data: unknown): string[] {
     return [];
   }
 
-  const rows: string[] = [];
-  for (const item of executed) {
-    const record = (item ?? {}) as {
-      name?: unknown;
-      ok?: unknown;
-      input?: unknown;
-      result?: unknown;
-      error?: unknown;
-    };
-
-    const name = typeof record.name === "string" && record.name ? record.name : "tool";
-    const ok = Boolean(record.ok);
-    const baseSummary = formatToolSummary(name, record.input, record.result);
-    const summary = ok ? baseSummary : `${baseSummary} (failed)`;
-    const detailBody = formatToolDetail(name, record.input, record.result);
-    const errorLine = `error: ${typeof record.error === "string" ? record.error : "tool execution failed"}`;
-    const detailRaw = ok
-      ? detailBody
-      : detailBody
-        ? `${errorLine}\n${detailBody}`
-        : errorLine;
-    const detail = ok && shouldCollapseSuccessDetail(name)
-      ? collapseRedundantSuccessDetail(summary, detailRaw)
-      : detailRaw;
-
-    rows.push(formatToolRow(summary, detail));
-  }
-
-  return rows;
+  return executed
+    .map((item) => parseToolExecutionRecord(item))
+    .filter((record): record is ToolExecutionRecord => Boolean(record))
+    .map((record) => formatToolCompletedExecutionRow(record));
 }
 
 function formatToolStartRows(data: unknown): string[] {
@@ -2821,14 +2854,15 @@ function formatToolStartRow(rawCall: unknown): string | null {
   if (!parsed) {
     return null;
   }
-  const summary = formatToolSummary(parsed.name, parsed.input, {});
-  return `${summary} (running...)`;
+  return formatToolLifecycleHeader("calling", parsed.name, parsed.input);
 }
 
 function formatToolCompletedRow(data: unknown): string | null {
-  const executed = (data as { executed?: unknown })?.executed;
-  const row = formatToolRows({ executed: [executed] })[0];
-  return typeof row === "string" && row.trim() ? row : null;
+  const executed = parseToolExecutionRecord((data as { executed?: unknown })?.executed);
+  if (!executed) {
+    return null;
+  }
+  return formatToolCompletedExecutionRow(executed);
 }
 
 function shouldCollapseSuccessDetail(name: string): boolean {
@@ -2847,10 +2881,214 @@ function shouldCollapseSuccessDetail(name: string): boolean {
   );
 }
 
-function formatToolRow(summary: string, detail: string): string {
-  const lines = detail.replace(/\r\n/g, "\n").split("\n");
-  const firstLine = lines.find((line) => line.trim())?.trim() || "ok";
-  return `${summary}\n  -> ${clipInline(firstLine, 180)}`;
+type ToolExecutionRecord = {
+  name: string;
+  ok: boolean;
+  input: Record<string, unknown>;
+  result: unknown;
+  error?: string;
+};
+
+const TOOL_RENDER_DEFAULT_WIDTH = 100;
+const TOOL_RENDER_MIN_WIDTH = 24;
+const TOOL_OUTPUT_MAX_LINES = 5;
+
+function parseToolExecutionRecord(raw: unknown): ToolExecutionRecord | null {
+  if (!isRecord(raw)) {
+    return null;
+  }
+  const record = isRecord(raw.executed) ? raw.executed : raw;
+  const name = readTrimmedString(record.name) || "tool";
+  const input = isRecord(record.input) ? record.input : {};
+  const error = readTrimmedString(record.error) || undefined;
+  return {
+    name,
+    ok: record.ok === true,
+    input,
+    result: record.result,
+    error,
+  };
+}
+
+function formatToolCompletedExecutionRow(record: ToolExecutionRecord): string {
+  const header = formatToolLifecycleHeader("called", record.name, record.input);
+  const bodyLines = formatToolExecutionBodyLines(record);
+  if (bodyLines.length === 0) {
+    return header;
+  }
+  return [header, ...prefixToolBodyLines(bodyLines)].join("\n");
+}
+
+function formatToolLifecycleHeader(
+  phase: "calling" | "called",
+  name: string,
+  input: Record<string, unknown>,
+): string {
+  const label = phase === "calling" ? "Calling" : "Called";
+  const invocation = formatToolInvocation(name, input);
+  const wrapWidth = getToolWrapWidth();
+  const inline = `${label} ${invocation}`;
+  if (inline.length <= wrapWidth) {
+    return inline;
+  }
+
+  const invocationLines = wrapToolLines(invocation, Math.max(TOOL_RENDER_MIN_WIDTH, wrapWidth - 4));
+  return [
+    `${label}`,
+    ...invocationLines.map((line, index) => `${index === 0 ? "  └ " : "    "}${line}`),
+  ].join("\n");
+}
+
+function formatToolInvocation(name: string, input: Record<string, unknown>): string {
+  const args =
+    Object.keys(input).length === 0
+      ? ""
+      : safeJsonStringify(input)
+          .replace(/\s+/g, " ")
+          .trim();
+  return `${name}(${args})`;
+}
+
+function formatToolExecutionBodyLines(record: ToolExecutionRecord): string[] {
+  const outputLines = formatToolOutputLines(record.name, record.input, record.result);
+  if (!record.ok) {
+    const lines = [`Error: ${record.error ?? "tool execution failed"}`];
+    if (outputLines.length > 0) {
+      lines.push(...outputLines);
+    }
+    return truncateToolBodyLines(lines);
+  }
+
+  if (outputLines.length === 0) {
+    return ["(no output)"];
+  }
+
+  return truncateToolBodyLines(outputLines);
+}
+
+function formatToolOutputLines(name: string, input: Record<string, unknown>, result: unknown): string[] {
+  const record = isRecord(result) ? result : {};
+  const combinedProcessOutput = getCombinedProcessOutput(record).trim();
+  if (combinedProcessOutput) {
+    return toMultilineLines(combinedProcessOutput);
+  }
+
+  if (name === "search_web") {
+    const results = Array.isArray(record.results) ? record.results : [];
+    if (results.length > 0) {
+      const rows = results.slice(0, 6).map((entry, index) => {
+        const row = isRecord(entry) ? entry : {};
+        const title = readTrimmedString(row.title) || readTrimmedString(row.url) || `result ${index + 1}`;
+        const url = readTrimmedString(row.url);
+        return url ? `${title} - ${url}` : title;
+      });
+      if (results.length > rows.length) {
+        rows.push(`... +${results.length - rows.length} results`);
+      }
+      return rows;
+    }
+  }
+
+  if (name === "list_background_js") {
+    const sessions = Array.isArray(record.sessions) ? record.sessions : [];
+    if (sessions.length > 0) {
+      return sessions.slice(0, 8).map((entry, index) => {
+        const session = isRecord(entry) ? entry : {};
+        const sessionName = readTrimmedString(session.session_name) || `session ${index + 1}`;
+        const status = readTrimmedString(session.status) || "unknown";
+        return `${sessionName} (${status})`;
+      });
+    }
+  }
+
+  const message = readTrimmedString(record.message);
+  if (message) {
+    return toMultilineLines(message);
+  }
+
+  const detail = formatToolDetail(name, input, result).trim();
+  if (detail && detail.toLowerCase() !== "ok") {
+    return toMultilineLines(detail);
+  }
+
+  if (typeof result === "string") {
+    const raw = result.trim();
+    if (raw) {
+      return toMultilineLines(raw);
+    }
+  }
+
+  if (isRecord(result) && Object.keys(result).length > 0) {
+    return toMultilineLines(formatInlineJson(result));
+  }
+
+  return [];
+}
+
+function truncateToolBodyLines(lines: string[]): string[] {
+  const wrapWidth = Math.max(TOOL_RENDER_MIN_WIDTH, getToolWrapWidth() - 4);
+  const wrapped = lines.flatMap((line) => wrapToolLines(line, wrapWidth));
+  if (wrapped.length <= TOOL_OUTPUT_MAX_LINES * 2) {
+    return wrapped;
+  }
+
+  const head = wrapped.slice(0, TOOL_OUTPUT_MAX_LINES);
+  const tail = wrapped.slice(-TOOL_OUTPUT_MAX_LINES);
+  const omitted = wrapped.length - (head.length + tail.length);
+  return [...head, `… +${omitted} lines`, ...tail];
+}
+
+function prefixToolBodyLines(lines: string[]): string[] {
+  return lines.map((line, index) => `${index === 0 ? "  └ " : "    "}${line}`);
+}
+
+function getToolWrapWidth(): number {
+  const columns =
+    typeof process.stdout.columns === "number" && Number.isFinite(process.stdout.columns)
+      ? process.stdout.columns
+      : TOOL_RENDER_DEFAULT_WIDTH;
+  return Math.max(TOOL_RENDER_MIN_WIDTH, columns - 8);
+}
+
+function toMultilineLines(text: string): string[] {
+  return text
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.trimEnd())
+    .filter((line) => line.trim().length > 0);
+}
+
+function wrapToolLines(text: string, width: number): string[] {
+  const normalized = text.replace(/\r\n/g, "\n");
+  const lines = normalized.split("\n");
+  const wrapped: string[] = [];
+
+  for (const rawLine of lines) {
+    const queue = rawLine.trimEnd();
+    if (!queue) {
+      wrapped.push("");
+      continue;
+    }
+
+    let remaining = queue;
+    while (remaining.length > width) {
+      let breakIndex = remaining.lastIndexOf(" ", width);
+      if (breakIndex <= 0) {
+        breakIndex = width;
+      }
+      const segment = remaining.slice(0, breakIndex).trimEnd();
+      if (segment) {
+        wrapped.push(segment);
+      }
+      remaining = remaining.slice(breakIndex).trimStart();
+    }
+
+    if (remaining) {
+      wrapped.push(remaining);
+    }
+  }
+
+  return wrapped;
 }
 
 function formatToolSummary(name: string, input: unknown, result: unknown): string {

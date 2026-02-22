@@ -2015,10 +2015,6 @@ function findProviderForModel(
   modelId: string,
   availableModels: ModelOption[],
 ): AuthProvider | null {
-  if (availableModels.length === 0) {
-    return null;
-  }
-
   const direct = availableModels.find((option) => option.id === modelId)?.provider;
   if (direct) {
     return direct;
