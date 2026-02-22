@@ -3,6 +3,15 @@
 `loaf` is a terminal-first AI coding assistant built with Ink + React.
 It supports multi-provider model auth, local tool execution, skills, chat history, and optional web search.
 
+## Documentation
+
+- [Docs Index](docs/README.md)
+- [Usage Guide](docs/usage.md)
+- [Skills Guide](docs/skills.md)
+- [Tools Guide](docs/tools.md)
+- [RPC Protocol](docs/rpc.md)
+- [Custom Tools Authoring](CUSTOM_TOOLS.md)
+
 ## Highlights
 
 - OpenAI OAuth and OpenRouter API key support in one setup.
@@ -35,6 +44,7 @@ On first launch, `loaf` runs onboarding so you can configure providers and (opti
 | `/onboarding` | Re-run setup flow (auth + Exa key). |
 | `/forgeteverything` | Wipe local config and restart onboarding. |
 | `/model` | Choose model, thinking level, and OpenRouter routing provider. |
+| `/limits` | Show current provider usage/limit snapshot when available. |
 | `/history` | Resume saved chats (`/history`, `/history last`, `/history <id>`). |
 | `/skills` | List discovered skills and description previews. |
 | `/tools` | List registered tools. |
@@ -57,7 +67,7 @@ Protocol and method/event docs are in `docs/rpc.md`.
 
 - Use `/skills` to list discovered skills and mention `$skill-name` to apply one.
 - Use `/tools` to list all currently registered tools.
-- Custom tools are supported. See `CUSTOM_TOOLS.md` and `src/tools/README.md`.
+- Custom tools are supported. See `docs/tools.md`, `CUSTOM_TOOLS.md`, and `src/tools/README.md`.
 
 ## Configuration
 
